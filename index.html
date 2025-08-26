@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<html lang="en">
   <head>
     <title>OKX Tick Chart</title>
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
@@ -14,14 +14,16 @@
     <link rel="stylesheet" href="https://cdn3.devexpress.com/jslib/25.1.4/css/dx.material.teal.dark.css" />
     <script src="https://cdn3.devexpress.com/jslib/25.1.4/js/dx.all.js"></script>
 
-    <link rel="stylesheet" href="styles.css" />
     <style>
       body.dx-viewport { background:#0b0e16; }
-      .demo-container { max-width: 1200px; margin: 24px auto; padding: 0 16px; }
-      .toolbar { display: grid; grid-template-columns: 200px 180px 140px 1fr; gap: 12px; align-items: center; margin-bottom: 12px; }
-      .toolbar .label { color:#bcd; font: 500 13px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+      .demo-container { max-width: 100%; margin: 24px auto; padding: 0 16px; overflow-x: auto; }
+      .toolbar {
+        display: grid;
+        grid-template-columns: 200px 180px 140px 200px 1fr;
+        gap: 12px; align-items: center; margin-bottom: 12px;
+      }
       #chart { height: 640px; }
-      .status { color:#9fb3c8; font-size: 12px; text-align: right; }
+      .status { color:#9fb3c8; font-size: 12px; text-align: right; white-space: nowrap; }
     </style>
 
     <script src="index.js"></script>
@@ -32,6 +34,7 @@
         <div id="symbol"></div>
         <div id="period"></div>
         <div id="submit"></div>
+        <div id="widthBox"></div>
         <div class="status"><span id="status-text">Ready</span></div>
       </div>
 

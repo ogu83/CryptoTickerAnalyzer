@@ -1,11 +1,13 @@
 // ====== Config ======
-const API_BASE = "http://localhost:8000"; // use localhost in the browser (not 0.0.0.0)
-
-// Symbols & periods for the dropdowns
+const API_BASE = "http://localhost:8000";
 const SYMBOLS = ["BTC-USDT", "ETH-USDT"];
 const PERIODS = [1, 10, 100, 1000];
+const DEFAULT_HEIGHT = 640;
 
-// Map API rows -> DevExtreme candlestick points
+// minimum pixels per candle for auto width suggestion
+const MIN_PX_PER_CANDLE = 4;
+const MIN_CHART_WIDTH = 600;
+
 function toCandles(rows) {
   return rows.map(r => ({
     date: r.time ? new Date(r.time) : null,
@@ -20,98 +22,83 @@ function toCandles(rows) {
 async function loadBars(symbol, period) {
   const url = `${API_BASE}/tick-chart?symbol=${encodeURIComponent(symbol)}&period=${period}`;
   const res = await fetch(url, { headers: { "Accept": "application/json" }});
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status} ${res.statusText} ${text}`);
-  }
-  return await res.json();
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  return res.json();
 }
 
-function setStatus(text) {
-  $("#status-text").text(text);
-}
+function setStatus(text) { $("#status-text").text(text); }
 
 $(() => {
-  // --- UI widgets ---
+  // --- Selectors & Button ---
   const symbolSelect = $("#symbol").dxSelectBox({
-    dataSource: SYMBOLS,
-    label: "Symbol",
-    labelMode: "floating",
-    value: SYMBOLS[0],
-    searchEnabled: true,
-    elementAttr: { "aria-label": "Symbol" }
+    dataSource: SYMBOLS, label: "Symbol", labelMode: "floating",
+    value: SYMBOLS[0], searchEnabled: true
   }).dxSelectBox("instance");
 
   const periodSelect = $("#period").dxSelectBox({
-    dataSource: PERIODS,
-    label: "Period (ticks)",
-    labelMode: "floating",
-    value: PERIODS[2], // default 100
-    elementAttr: { "aria-label": "Period" }
+    dataSource: PERIODS, label: "Period (ticks)", labelMode: "floating",
+    value: PERIODS[2]
   }).dxSelectBox("instance");
 
   const submitBtn = $("#submit").dxButton({
-    text: "Submit",
-    type: "default",
-    stylingMode: "contained",
-    width: 120,
+    text: "Submit", type: "default", stylingMode: "contained", width: 120,
     onClick: () => refreshChart()
   }).dxButton("instance");
 
-  // Chart init
+  // --- Width controller (NumberBox) ---
+  const widthBox = $("#widthBox").dxNumberBox({
+    label: "Chart width (px)", labelMode: "floating",
+    value: 1000, min: 300, max: 20000, step: 100, showSpinButtons: true,
+    onEnterKey: () => applyChartWidth(widthBox.option("value")),
+    onValueChanged: (e) => {
+      // live-apply on change; comment this out if you prefer "Apply" button
+      if (e && e.value) applyChartWidth(e.value);
+    }
+  }).dxNumberBox("instance");
+
+  // --- Chart ---
   const chart = $("#chart").dxChart({
-    title: {
-      text: "Tick Candles",
-      font: { size: 16, weight: 600, color: "#cfe3ff" }
-    },
-    palette: "Material",
+    title: { text: "Tick Candles", font: { size: 16, weight: 600, color: "#cfe3ff" } },
     dataSource: [],
-    commonSeriesSettings: {
-      argumentField: "date",
-      type: "candlestick"
-    },
-    series: [{
-      name: "Price",
-      openValueField: "o",
-      highValueField: "h",
-      lowValueField: "l",
-      closeValueField: "c",
-      reduction: { color: "#e05260" }
-    }],
+    size: { height: DEFAULT_HEIGHT }, // width will be set dynamically
+    commonSeriesSettings: { argumentField: "date", type: "candlestick" },
+    series: [{ name: "Price", openValueField: "o", highValueField: "h", lowValueField: "l", closeValueField: "c",
+               reduction: { color: "#e05260" } }],
     legend: { visible: false },
     valueAxis: {
-      position: "right",
-      grid: { opacity: 0.15 },
-      label: {
-        customizeText(e) { return Number(e.value).toLocaleString(); }
-      }
+      position: "right", grid: { opacity: 0.15 },
+      label: { customizeText: (e) => Number(e.value).toLocaleString() }
     },
-    argumentAxis: {
-      workdaysOnly: false,
-      grid: { opacity: 0.1 },
-      valueMarginsEnabled: true,
-      label: { format: "hh:mm:ss" }
-    },
+    argumentAxis: { workdaysOnly: false, grid: { opacity: 0.1 }, valueMarginsEnabled: true, label: { format: "M/d h:m:ss" } },
     crosshair: { enabled: true, color: "#66aaff" },
     tooltip: {
-      enabled: true,
-      location: "edge",
-      customizeTooltip(arg) {
+      enabled: true, location: "edge",
+      customizeTooltip: (arg) => {
         const d = arg.argument instanceof Date ? arg.argument.toLocaleString() : arg.argumentText;
-        return {
-          html:
-            `<div>
-              <div><b>${d}</b></div>
-              <div>Open: ${arg.openValue}</div>
-              <div>High: ${arg.highValue}</div>
-              <div>Low:  ${arg.lowValue}</div>
-              <div>Close:${arg.closeValue}</div>
-            </div>`
+        return { html:
+          `<div>
+             <div><b>${d}</b></div>
+             <div>Open: ${arg.openValue}</div>
+             <div>High: ${arg.highValue}</div>
+             <div>Low:  ${arg.lowValue}</div>
+             <div>Close:${arg.closeValue}</div>
+           </div>`
         };
       }
     },
     export: { enabled: true }
   }).dxChart("instance");
+
+  function applyChartWidth(px) {
+    const width = Number(px);
+    if (Number.isFinite(width) && width > 0) {
+      chart.option("size", { width, height: DEFAULT_HEIGHT });
+      // container scrolls horizontally if width > viewport
+    } else {
+      // auto width (unset), will fit container
+      chart.option("size", { width: undefined, height: DEFAULT_HEIGHT });
+    }
+  }
 
   async function refreshChart() {
     const symbol = symbolSelect.option("value");
@@ -124,19 +111,23 @@ $(() => {
       const rows = await loadBars(symbol, period);
       const data = toCandles(rows);
 
-      // Update chart
       chart.option({
         title: `Tick Candles • ${symbol} • ${period} ticks`,
         dataSource: data
       });
 
-      // Slight zoom: show latest 200 bars if huge
+      // auto-suggest a width so candles have some minimum visual width
+      const suggested = Math.max(MIN_CHART_WIDTH, data.length * MIN_PX_PER_CANDLE);
+      widthBox.option("value", suggested);
+      applyChartWidth(suggested);
+
+      // show last 200 bars if many
       if (data.length > 200) {
         const from = data[data.length - 200].date;
         const to = data[data.length - 1].date;
         chart.getArgumentAxis().visualRange({ startValue: from, endValue: to });
       } else {
-        chart.getArgumentAxis().visualRange(undefined); // reset
+        chart.getArgumentAxis().visualRange(undefined);
       }
 
       setStatus(`Loaded ${data.length} bars • Updated ${new Date().toLocaleTimeString()}`);
