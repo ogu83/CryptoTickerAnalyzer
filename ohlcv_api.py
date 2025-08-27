@@ -17,7 +17,10 @@ PG_PORT = 5432
 PG_USER = "postgres"
 PG_PASSWORD = "Postgres2839*"
 PG_DBNAME = "CryptoTickers"   # target DB name
-PG_DBO_SCHEMA = "okx"         # schema name
+
+# Schemas
+PG_DBO_SCHEMA_OKX = "okx"
+PG_DBO_SCHEMA_BINANCE = "bnc"
 
 CONNINFO = (
     f"host={PG_HOST} port={PG_PORT} dbname={PG_DBNAME} "
@@ -25,7 +28,7 @@ CONNINFO = (
 )
 
 # ---------------- FastAPI setup ----------------
-app = FastAPI(title="OKX OHLCV API", version="1.0")
+app = FastAPI(title="OHLCV API (OKX/Binance)", version="1.1")
 
 # Allow browser clients during dev; tighten in prod
 app.add_middleware(
@@ -38,7 +41,6 @@ app.add_middleware(
 pool = ConnectionPool(CONNINFO, min_size=1, max_size=10, kwargs={"row_factory": dict_row})
 
 def _to_iso_z(ts: datetime) -> str:
-    # Ensure RFC3339/ISO 8601 with Z suffix
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -47,40 +49,91 @@ def _to_num(x: Any) -> float | None:
     if x is None:
         return None
     if isinstance(x, Decimal):
-        return float(x)  # chart-friendly; switch to str(x) if you prefer exactness
+        return float(x)
     if isinstance(x, (int, float)):
         return float(x)
-    # Fallback if DB driver returns strings for numerics
     try:
         return float(x)
     except Exception:
         return None
 
+def _parse_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    s = s.strip()
+    # Accept ...Z or offset; make tz-aware
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid datetime format: {s!r}. Use ISO 8601, e.g. 2025-08-26T00:00:00Z")
+    # If no tzinfo provided, assume UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
 @app.get("/")
 def root():
     return {
-        "service": "OKX OHLCV API",
+        "service": "OHLCV API",
         "endpoints": ["/tick-chart"],
-        "example": "/tick-chart?symbol=BTC-USDT&period=100"
+        "examples": [
+            "/tick-chart?symbol=BTC-USDT&period=100",                             # OKX default
+            "/tick-chart?venue=bnc&symbol=BTCUSDT&period=100",                   # Binance
+            "/tick-chart?symbol=BTC-USDT&period=1000&start=2025-08-26T00:00:00Z&end=2025-08-27T00:00:00Z"
+        ]
     }
 
 @app.get("/tick-chart")
 def get_tick_chart(
-    symbol: str = Query(..., min_length=1, description="Instrument id, e.g. BTC-USDT"),
-    period: int = Query(..., ge=1, le=1_000_000, description="Number of ticks per bar")
+    symbol: str = Query(..., min_length=1, description="Instrument id (OKX: BTC-USDT, Binance: BTCUSDT)"),
+    period: int = Query(..., ge=1, le=1_000_000, description="Number of ticks per bar"),
+    venue: str = Query("okx", regex="^(okx|bnc)$", description="Data source: okx or bnc"),
+    start: str | None = Query(None, description="ISO datetime (inclusive), e.g. 2025-08-26T00:00:00Z"),
+    end: str | None = Query(None, description="ISO datetime (exclusive), e.g. 2025-08-27T00:00:00Z"),
 ) -> JSONResponse:
-    # Call okx.ticker_ohlcv(symbol, period)
-    sql = f"""select "time","open","close","high","low","volume"
-              from {PG_DBO_SCHEMA}.ticker_ohlcv(%s, %s);"""
+    # Choose schema by venue
+    schema = PG_DBO_SCHEMA_OKX if venue == "okx" else PG_DBO_SCHEMA_BINANCE
+
+    # Parse optional filters
+    start_dt = _parse_dt(start)
+    end_dt = _parse_dt(end)
+
+    # symbol fixup for Binance
+    if venue == "bnc" and "-" in symbol:
+        symbol = symbol.replace("-", "")
+
+    # symbol fixup for OKX
+    if venue == "okx" and "-" not in symbol:
+        if len(symbol) > 6:
+            symbol = symbol[:-4] + "-" + symbol[-4:]
+        else:
+            symbol = symbol[:-3] + "-" + symbol[-3:]  
+
+    # Build SQL; filter on the view's "time" if provided
+    params: List[Any] = [symbol, period]
+    sql = f'''select "time","open","close","high","low","volume"
+              from {schema}.ticker_ohlcv(%s, %s)'''
+    conditions: List[str] = []
+    if start_dt is not None:
+        conditions.append('"time" >= %s')
+        params.append(start_dt)
+    if end_dt is not None:
+        conditions.append('"time" < %s')
+        params.append(end_dt)
+    if conditions:
+        sql += " where " + " and ".join(conditions)
+    sql += ' order by "time"'
+
     try:
         with pool.connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (symbol, period))
+                cur.execute(sql, params)
                 rows = cur.fetchall()
     except psycopg.Error as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e.pgerror or str(e)}")
 
-    # Normalize to plain JSON
     out: List[Dict[str, Any]] = []
     for r in rows:
         out.append({
