@@ -2,6 +2,8 @@
 
 Stream live tickers from **OKX** and **Binance USDⓈ-M Futures** into PostgreSQL, aggregate them into N-tick OHLCV bars via a SQL function, expose them through a **FastAPI** endpoint, and visualize with a lightweight **DevExtreme (jQuery)** UI.
 
+<img width="1819" height="1122" alt="msedge_RuNIj1FRoQ" src="https://github.com/user-attachments/assets/4a69b868-0ceb-4847-9f54-db1c7c08f24a" />
+
 ---
 
 ## Contents
