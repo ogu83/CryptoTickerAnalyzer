@@ -10,7 +10,7 @@
     <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
     <script>window.jQuery || document.write(decodeURIComponent('%3Cscript src="js/jquery.min.js"%3E%3C/script%3E'))</script>
 
-    <!-- DevExtreme (Material teal dark to match your sample) -->
+    <!-- DevExtreme (Material teal dark) -->
     <link rel="stylesheet" href="https://cdn3.devexpress.com/jslib/25.1.4/css/dx.material.teal.dark.css" />
     <script src="https://cdn3.devexpress.com/jslib/25.1.4/js/dx.all.js"></script>
 
@@ -19,14 +19,13 @@
       .demo-container { max-width: 100%; margin: 24px auto; padding: 0 16px; overflow-x: auto; }
       .toolbar {
         display: grid;
-        grid-template-columns: 140px 200px 160px 360px 120px 200px 1fr;
+        grid-template-columns: 180px 200px 160px 360px 120px 200px 1fr;
         gap: 12px; align-items: center; margin-bottom: 12px;
       }
-      #chart { height: 640px; }
       .status { color:#9fb3c8; font-size: 12px; text-align: right; white-space: nowrap; }
-      @media (max-width: 1000px) {
-        .toolbar { grid-template-columns: 1fr; }
-      }
+      .charts { display: grid; grid-template-rows: auto auto; gap: 16px; }
+      #chartOkx, #chartBnc { height: 500px; }
+      @media (max-width: 1000px) { .toolbar { grid-template-columns: 1fr; } }
     </style>
 
     <script src="index.js"></script>
@@ -43,7 +42,10 @@
         <div class="status"><span id="status-text">Ready</span></div>
       </div>
 
-      <div id="chart"></div>
+      <div class="charts">
+        <div id="chartOkx"></div>
+        <div id="chartBnc"></div>
+      </div>
     </div>
   </body>
 </html>
