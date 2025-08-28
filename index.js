@@ -1,5 +1,5 @@
 // ====== Config ======
-const API_BASE = "http://localhost:8200";
+const API_BASE = "http://macbook-server:8200";
 const VENUES = [
   { code: "okx", name: "OKX" },
   { code: "bnc", name: "Binance" },
