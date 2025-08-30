@@ -41,8 +41,10 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
-def rolling_vol(series: pd.Series, win: int) -> pd.Series:
-    return series.rolling(win, min_periods=max(2, win//2)).std().fillna(method="bfill").fillna(0.0)
+def rolling_vol(series, win):
+    # std() can start as NaN; backfill then final 0.0 for any all-NaN windows
+    return (series.rolling(win, min_periods=max(2, win//2)).std()
+            .bfill().fillna(0.0))
 
 def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     prev_close = close.shift(1)
@@ -53,9 +55,10 @@ def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, win: int = 14) -> pd.Series:
+def atr(high, low, close, win=14):
     tr = true_range(high, low, close)
-    return tr.ewm(alpha=1/win, adjust=False).mean().fillna(method="bfill").fillna(0.0)
+    return (tr.ewm(alpha=1/win, adjust=False).mean()
+            .bfill().fillna(0.0))
 
 def zscore(series: pd.Series, win: int) -> pd.Series:
     m = series.rolling(win, min_periods=max(2, win//2)).mean()
@@ -93,6 +96,23 @@ def align(df_okx: pd.DataFrame, df_bnc: pd.DataFrame, tol="2s") -> pd.DataFrame:
     merged = pd.merge_asof(L, R, on="time", direction="nearest",
                            tolerance=pd.Timedelta(tol), suffixes=("_okx","_bnc"))
     return merged.dropna().set_index("time")
+
+def align_okx_binance(df_okx, df_bnc, tolerance="2s"):
+    left  = df_okx.reset_index().rename(columns={"time": "time"}).sort_values("time")
+    right = df_bnc.reset_index().rename(columns={"time": "time"}).sort_values("time")
+
+    # Use backward so we only take Binance info from <= OKX time (no lookahead)
+    m = pd.merge_asof(
+        left, right, on="time",
+        direction="backward",
+        tolerance=pd.Timedelta(tolerance),
+        suffixes=("_okx", "_bnc")
+    )
+    # Now keep OKX rows; Binance columns may be NaN if too stale
+    # (Optional) drop overly stale rows, or forward-fill limited columns if desired
+    m = m.dropna(subset=["close_bnc"])  # or keep and later .fillna(method='ffill') for selected features
+    return m.set_index("time")
+
 
 # ------------------ feature builder ------------------ #
 
@@ -224,7 +244,8 @@ def main():
     okx = fetch(args.api, "okx", args.symbol, args.period, args.start, args.end)
     bnc = fetch(args.api, "bnc", args.symbol, args.period, args.start, args.end)
 
-    m = align(okx, bnc, tol=args.tolerance)
+    # m = align(okx, bnc, tol=args.tolerance)
+    m = align_okx_binance(okx, bnc, tol=args.tolerance)
     if len(m) < args.window + 50:
         raise SystemExit(f"Aligned rows {len(m)} too small for window {args.window}. Expand date range or relax tolerance.")
 
