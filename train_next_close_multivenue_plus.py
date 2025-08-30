@@ -97,20 +97,28 @@ def align(df_okx: pd.DataFrame, df_bnc: pd.DataFrame, tol="2s") -> pd.DataFrame:
                            tolerance=pd.Timedelta(tol), suffixes=("_okx","_bnc"))
     return merged.dropna().set_index("time")
 
-def align_okx_binance(df_okx, df_bnc, tolerance="2s"):
+def align_okx_binance(df_okx, df_bnc, tolerance="2s", max_ffill="5s"):
     left  = df_okx.reset_index().rename(columns={"time": "time"}).sort_values("time")
     right = df_bnc.reset_index().rename(columns={"time": "time"}).sort_values("time")
 
-    # Use backward so we only take Binance info from <= OKX time (no lookahead)
+    # causal: only use Binance info available at or before OKX time
     m = pd.merge_asof(
         left, right, on="time",
         direction="backward",
         tolerance=pd.Timedelta(tolerance),
         suffixes=("_okx", "_bnc")
     )
-    # Now keep OKX rows; Binance columns may be NaN if too stale
-    # (Optional) drop overly stale rows, or forward-fill limited columns if desired
-    m = m.dropna(subset=["close_bnc"])  # or keep and later .fillna(method='ffill') for selected features
+
+    # age of Binance info (seconds) relative to OKX bar
+    m["bnc_age_sec"] = (m["time"] - m["time"].where(m["close_bnc"].notna()).ffill()).dt.total_seconds()
+
+    # forward-fill selected Binance cols up to max_ffill
+    max_age = pd.Timedelta(max_ffill).total_seconds()
+    bnc_cols = [c for c in m.columns if c.endswith("_bnc")]
+    m[bnc_cols] = m[bnc_cols].ffill()
+    # mask too-stale rows (optional: drop or keep with large age)
+    m = m[m["bnc_age_sec"].fillna(max_age) <= max_age]
+
     return m.set_index("time")
 
 
