@@ -245,7 +245,7 @@ def main():
     bnc = fetch(args.api, "bnc", args.symbol, args.period, args.start, args.end)
 
     # m = align(okx, bnc, tol=args.tolerance)
-    m = align_okx_binance(okx, bnc, tol=args.tolerance)
+    m = align_okx_binance(okx, bnc, args.tolerance)
     if len(m) < args.window + 50:
         raise SystemExit(f"Aligned rows {len(m)} too small for window {args.window}. Expand date range or relax tolerance.")
 
