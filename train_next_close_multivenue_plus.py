@@ -12,16 +12,25 @@ Usage:
   python3 train_next_close_multivenue_plus.py --symbol ETH-USDT --period 10 --target delta --epochs 80 --window 64 --plot
 """
 
+import json
 import argparse, math, os
 from typing import Optional, Tuple
 import numpy as np, pandas as pd, requests, matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+import psycopg
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+
+# ---------------- Postgres connection info ----------------
+PG_HOST = "macbook-server"
+PG_PORT = 5432
+PG_USER = "postgres"
+PG_PASSWORD = "Postgres2839*"
+PG_DBNAME = "CryptoTickers"   # target DB name
 
 # ------------------ helpers: indicators (causal) ------------------ #
 
@@ -139,6 +148,11 @@ def build_features(m: pd.DataFrame) -> pd.DataFrame:
     df["co_ret_okx"] = (df["close_okx"] - df["open_okx"]) / df["open_okx"]
     df["co_ret_bnc"] = (df["close_bnc"] - df["open_bnc"]) / df["open_bnc"]
 
+    #lags
+    df["lr_okx_lag1"]   = df["lr_okx"].shift(1)
+    df["lr_okx_lag2"]   = df["lr_okx"].shift(2)
+    df["vol20_okx_lag1"] = df["vol20_okx"].shift(1)
+
     # momentum / mean-reversion
     df["rsi14_okx"] = rsi(df["close_okx"], 14)
     df["ema12_okx"] = ema(df["close_okx"], 12)
@@ -172,6 +186,7 @@ def build_features(m: pd.DataFrame) -> pd.DataFrame:
         "spread","spread_z50","corr20","lr_bnc_lag1","vol20_bnc_lag1","co_ret_bnc_lag1",
         "vol_z_okx","vol_z_bnc"
     ]
+    feat_cols += ["lr_okx_lag1", "lr_okx_lag2", "vol20_okx_lag1"]
     # keep close_okx for convenience (target/prev use)
     return df[feat_cols + ["close_okx"]].dropna()
 
@@ -199,18 +214,43 @@ def split_scale(X, y, index, ratio=0.8):
     idx_tr, idx_te = index[-N:][:split], index[-N:][split:]
     return Xtr, Xte, ytr, yte, idx_tr, idx_te, feat_scaler, y_scaler
 
+def walk_forward_splits(n_rows, n_folds=3, train_frac=0.7):
+    # yields (train_slice, test_slice) index ranges
+    fold_size = int((n_rows * (1 - train_frac)) / n_folds)
+    start = 0
+    for k in range(n_folds):
+        train_end = int(n_rows * train_frac) + k * fold_size
+        test_end  = train_end + fold_size
+        if test_end > n_rows: break
+        yield slice(0, train_end), slice(train_end, test_end)
+
+
 # ------------------ model ------------------ #
 
-def build_model(window: int, n_features: int) -> keras.Model:
+# def build_model(window: int, n_features: int) -> keras.Model:
+#     inp = keras.Input(shape=(window, n_features))
+#     x = layers.LSTM(128, return_sequences=True, kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
+#     x = layers.Dropout(0.25)(x)
+#     x = layers.LSTM(64, return_sequences=False, kernel_regularizer=keras.regularizers.l2(1e-5))(x)
+#     x = layers.Dropout(0.25)(x)
+#     x = layers.Dense(64, activation="relu")(x)
+#     out = layers.Dense(1, activation="linear")(x)
+#     m = keras.Model(inp, out)
+#     m.compile(optimizer=keras.optimizers.Adam(1e-3), loss=keras.losses.Huber(delta=1.0))
+#     return m
+
+# simpler model (faster train, less overfit)
+def build_model(window, n_features):
     inp = keras.Input(shape=(window, n_features))
-    x = layers.LSTM(128, return_sequences=True, kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
-    x = layers.Dropout(0.25)(x)
-    x = layers.LSTM(64, return_sequences=False, kernel_regularizer=keras.regularizers.l2(1e-5))(x)
-    x = layers.Dropout(0.25)(x)
-    x = layers.Dense(64, activation="relu")(x)
-    out = layers.Dense(1, activation="linear")(x)
+    x = layers.LSTM(64, return_sequences=False,
+                    kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(32, activation="relu")(x)
+    out = layers.Dense(1)(x)
     m = keras.Model(inp, out)
-    m.compile(optimizer=keras.optimizers.Adam(1e-3), loss=keras.losses.Huber(delta=1.0))
+    opt = keras.optimizers.Adam(1e-3, clipnorm=1.0)
+    m.compile(optimizer=opt,
+              loss=keras.losses.Huber(delta=1.0))
     return m
 
 def dir_acc(y_true_price, y_pred_price, prev_close):
@@ -230,6 +270,21 @@ def evaluate(y_true_price, y_pred_price, y_naive_price, prev_close):
     return {"MAE": mae, "RMSE": rmse, "MAPE%": mape, "DirAcc": da,
             "MAE_naive": mae_n, "RMSE_naive": rmse_n, "MAPE%_naive": mape_n, "DirAcc_naive": da_n}
 
+
+# ------------------ log ------------------ #
+def log_metrics(dsn, run_id, params, metrics):
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        cur.execute("""
+            create table if not exists ml_eval (
+              id bigserial primary key,
+              run_id text, ts timestamptz default now(),
+              params jsonb, metrics jsonb
+            );
+        """)
+        cur.execute("insert into ml_eval (run_id, params, metrics) values (%s, %s::jsonb, %s::jsonb)",
+                    (run_id, json.dumps(params), json.dumps(metrics)))
+        conn.commit()
+
 # ------------------ main ------------------ #
 
 def main():
@@ -244,7 +299,12 @@ def main():
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--valsplit", type=float, default=0.1)
     ap.add_argument("--tolerance", default="2s")
-    ap.add_argument("--target", choices=["price","delta"], default="delta")
+    ap.add_argument(
+        "--target",
+        choices=["price", "delta", "delta_norm"],  # <— added delta_norm
+        default="delta",
+        help="Predict next close (price), next delta (close_t - close_{t-1}), or volatility-normalized delta"
+    )
     ap.add_argument("--plot", action="store_true")
     args = ap.parse_args()
 
@@ -261,11 +321,17 @@ def main():
     idx = feats.index
     close_okx = feats["close_okx"]
 
-    # target definition (OKX)
+    # --- Target definitions (OKX) ---
+    # price      : next close
+    # delta      : next close - current close
+    # delta_norm : (next close - current close) / (ATR14 at t-1 + 1e-8)
     if args.target == "price":
         target = close_okx.shift(-1)
-    else:
+    elif args.target == "delta":
         target = close_okx.shift(-1) - close_okx
+    else:  # delta_norm
+        target = (close_okx.shift(-1) - close_okx) / (feats["atr14_okx"].shift(1) + 1e-8)
+
 
     # Use all feature columns except raw close (avoid trivial leakage on 'price')
     feature_cols = [c for c in feats.columns if c != "close_okx"]
@@ -292,18 +358,33 @@ def main():
     y_pred = ysc.inverse_transform(y_pred_s).flatten()
     y_true = ysc.inverse_transform(yte).flatten()
 
-    # reconstruct price target & baseline
+    # --- Reconstruct PRICE metrics and baseline ---
+    # Align previous OKX close to each test target
     arr_close_okx = okx["close"].to_numpy()
     pos = okx.index.get_indexer(idx_te, method="nearest")
-    prev_pos = np.clip(pos - 1, 0, len(arr_close_okx)-1)
+    prev_pos = np.clip(pos - 1, 0, len(arr_close_okx) - 1)
     prev_close = arr_close_okx[prev_pos]
 
+    # Also align previous ATR14 (needed for delta_norm)
+    # Recompute ATR14 on raw OKX to avoid index mismatches
+    atr_okx_series = atr(okx["high"], okx["low"], okx["close"], 14)
+    arr_atr_okx = atr_okx_series.to_numpy()
+    prev_atr = arr_atr_okx[prev_pos]
+
     if args.target == "price":
-        y_pred_price = y_pred; y_true_price = y_true
-    else:
+        # y_pred / y_true are already in price space
+        y_pred_price = y_pred
+        y_true_price = y_true
+    elif args.target == "delta":
+        # price = prev_close + delta
         y_pred_price = prev_close + y_pred
         y_true_price = prev_close + y_true
+    else:  # delta_norm
+        # price = prev_close + delta_norm * prev_atr
+        y_pred_price = prev_close + y_pred * (prev_atr + 1e-8)
+        y_true_price = prev_close + y_true * (prev_atr + 1e-8)
 
+    # Naive baseline: next close = previous close
     y_naive_price = prev_close.copy()
 
     metrics = evaluate(y_true_price, y_pred_price, y_naive_price, prev_close)
@@ -324,5 +405,21 @@ def main():
         plt.savefig("pred_vs_actual_multivenue_plus.png")
         print("\nSaved plot: pred_vs_actual_multivenue_plus.png")
 
+    log_metrics(
+        dsn=f"host={PG_HOST} port={PG_PORT} user={PG_USER} password={PG_PASSWORD} dbname={PG_DBNAME}",
+        run_id=f"next_close_plus_{args.symbol}_{args.period}_{args.target}",
+        params={
+            "symbol": args.symbol,
+            "period": args.period,
+            "window": args.window,
+            "epochs": args.epochs,
+            "batch": args.batch,
+            "valsplit": args.valsplit,
+            "tolerance": args.tolerance,
+            "target": args.target
+        },
+        metrics=metrics
+    )
+    
 if __name__ == "__main__":
     main()
