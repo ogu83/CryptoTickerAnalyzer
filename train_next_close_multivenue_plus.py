@@ -227,31 +227,31 @@ def walk_forward_splits(n_rows, n_folds=3, train_frac=0.7):
 
 # ------------------ model ------------------ #
 
-# def build_model(window: int, n_features: int) -> keras.Model:
-#     inp = keras.Input(shape=(window, n_features))
-#     x = layers.LSTM(128, return_sequences=True, kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
-#     x = layers.Dropout(0.25)(x)
-#     x = layers.LSTM(64, return_sequences=False, kernel_regularizer=keras.regularizers.l2(1e-5))(x)
-#     x = layers.Dropout(0.25)(x)
-#     x = layers.Dense(64, activation="relu")(x)
-#     out = layers.Dense(1, activation="linear")(x)
-#     m = keras.Model(inp, out)
-#     m.compile(optimizer=keras.optimizers.Adam(1e-3), loss=keras.losses.Huber(delta=1.0))
-#     return m
+def build_model(window: int, n_features: int) -> keras.Model:
+    inp = keras.Input(shape=(window, n_features))
+    x = layers.LSTM(128, return_sequences=True, kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
+    x = layers.Dropout(0.25)(x)
+    x = layers.LSTM(64, return_sequences=False, kernel_regularizer=keras.regularizers.l2(1e-5))(x)
+    x = layers.Dropout(0.25)(x)
+    x = layers.Dense(64, activation="relu")(x)
+    out = layers.Dense(1, activation="linear")(x)
+    m = keras.Model(inp, out)
+    m.compile(optimizer=keras.optimizers.Adam(1e-3), loss=keras.losses.Huber(delta=1.0))
+    return m
 
 # simpler model (faster train, less overfit)
-def build_model(window, n_features):
-    inp = keras.Input(shape=(window, n_features))
-    x = layers.LSTM(64, return_sequences=False,
-                    kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
-    x = layers.Dropout(0.3)(x)
-    x = layers.Dense(32, activation="relu")(x)
-    out = layers.Dense(1)(x)
-    m = keras.Model(inp, out)
-    opt = keras.optimizers.Adam(1e-3, clipnorm=1.0)
-    m.compile(optimizer=opt,
-              loss=keras.losses.Huber(delta=1.0))
-    return m
+# def build_model(window, n_features):
+#     inp = keras.Input(shape=(window, n_features))
+#     x = layers.LSTM(64, return_sequences=False,
+#                     kernel_regularizer=keras.regularizers.l2(1e-5))(inp)
+#     x = layers.Dropout(0.3)(x)
+#     x = layers.Dense(32, activation="relu")(x)
+#     out = layers.Dense(1)(x)
+#     m = keras.Model(inp, out)
+#     opt = keras.optimizers.Adam(1e-3, clipnorm=1.0)
+#     m.compile(optimizer=opt,
+#               loss=keras.losses.Huber(delta=1.0))
+#     return m
 
 def dir_acc(y_true_price, y_pred_price, prev_close):
     up_t = np.sign(y_true_price.flatten() - prev_close.flatten())
