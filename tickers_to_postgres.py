@@ -25,7 +25,7 @@ OKX_PUBLIC_WS = "wss://ws.okx.com:8443/ws/v5/public"
 # Ref: https://developers.binance.com/.../websocket-market-streams (Connect)
 BINANCE_FUTURES_COMBINED = "wss://fstream.binance.com/stream"  # add ?streams=... below
 
-RECORD_ORDERBOOK = False  # set to True to enable OKX order book capture
+RECORD_ORDERBOOK = True  # set to True to enable OKX order book capture
 
 # ---------------- Instruments ----------------
 # Keep your OKX-style list; we’ll derive Binance symbols automatically.
