@@ -1,0 +1,9 @@
+{
+  "symbol": "ETH-USDT",
+  "period": 100,
+  "window": 64,
+  "target": "delta_norm",
+  "tolerance": "2s",
+  "save_dir": "models",
+  "model_name": "okx_ETH-USDT_100_dnorm_w64"
+}
