@@ -12,7 +12,8 @@ Usage:
   python3 train_next_close_multivenue_plus.py --symbol ETH-USDT --period 10 --target delta --epochs 80 --window 64 --plot
 """
 
-import json
+from pathlib import Path
+import joblib, json
 import argparse, math, os
 from typing import Optional, Tuple
 import numpy as np, pandas as pd, requests, matplotlib.pyplot as plt
@@ -289,6 +290,8 @@ def log_metrics(dsn, run_id, params, metrics):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--save-dir", default="models", help="Directory to write the trained model package")
+    ap.add_argument("--model-name", default=None, help="Optional model name; defaults to a derived run_id")
     ap.add_argument("--api", default="http://macbook-server:8200")
     ap.add_argument("--symbol", default="ETH-USDT")
     ap.add_argument("--period", type=int, default=10)
@@ -395,6 +398,70 @@ def main():
     print("\nVerdict:")
     print(f"  MAE better than naive? {'YES' if metrics['MAE'] < metrics['MAE_naive'] else 'NO'}")
     print(f"  Directional accuracy better than naive? {'YES' if metrics['DirAcc'] > metrics['DirAcc_naive'] else 'NO'}")
+
+    # ---------------- save model + scalers + config ----------------
+    run_id = f"okx_{args.symbol}_{args.period}_{args.target}_w{args.window}"
+    model_name = args.model_name or run_id
+    out_dir = Path(args.save_dir) / model_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Keras model (Keras v3 requires an explicit extension)
+    model_path = out_dir / "model.keras"
+    model.save(model_path.as_posix())
+    print(f"[model] saved to {model_path}")
+
+
+    # Scalers
+    joblib.dump(fsc, out_dir / "feature_scaler.pkl")
+    joblib.dump(ysc, out_dir / "target_scaler.pkl")
+
+    # Persist the exact feature order and config
+    with open(out_dir / "features.json", "w") as f:
+        json.dump(feature_cols, f, indent=2)   # 'feature_cols' is what you fed into supervised()
+
+    with open(out_dir / "config.json", "w") as f:
+        json.dump({
+            "symbol": args.symbol,
+            "period": args.period,
+            "window": args.window,
+            "target": args.target,
+            "tolerance": args.tolerance,
+            "save_dir": args.save_dir,
+            "model_name": model_name
+        }, f, indent=2)
+
+    print(f"[model] saved to {out_dir}")
+
+    # --------------- optional: register in Postgres ----------------
+    with psycopg.connect(f"host={PG_HOST} port={PG_PORT} user={PG_USER} password={PG_PASSWORD} dbname={PG_DBNAME}") as conn, conn.cursor() as cur:
+        cur.execute("""
+            create table if not exists ml_model_registry (
+                id bigserial primary key,
+                created_at timestamptz default now(),
+                model_name text unique,
+                path text,
+                params jsonb,
+                metrics jsonb
+            );
+        """)
+        cur.execute("""
+            insert into ml_model_registry (model_name, path, params, metrics)
+            values (%s, %s, %s::jsonb, %s::jsonb)
+            on conflict (model_name) do update set
+                path = EXCLUDED.path,
+                params = EXCLUDED.params,
+                metrics = EXCLUDED.metrics
+        """, (
+            model_name,
+            str(out_dir),
+            json.dumps({
+                "symbol": args.symbol, "period": args.period, "window": args.window,
+                "target": args.target, "tolerance": args.tolerance
+            }),
+            json.dumps(metrics)
+        ))
+        conn.commit()
+    print(f"[db] model registered as '{model_name}'")
 
     if args.plot:
         plt.figure(figsize=(12,5))
