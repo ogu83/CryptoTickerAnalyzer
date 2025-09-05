@@ -137,6 +137,16 @@ def supervised_matrix(feats: pd.DataFrame, cols_in_order, window: int):
     idx = feats.index[window:]
     return X, idx
 
+def sanitize_for_json(obj):
+    import math
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    return obj
+
 # ----------------- trade simulator -----------------
 def backtest_long_short(times, pred_price, prev_close, okx_open_series, okx_close_series,
                         threshold_norm, target_mode, prev_atr, init_usdt=10000,
@@ -213,12 +223,17 @@ def backtest_long_short(times, pred_price, prev_close, okx_open_series, okx_clos
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True, help="Folder with saved Keras model + scalers + config/features")
+    ap.add_argument("--threshold", type=float, default=0.03,  # was 0.15
+                help="Signal threshold on normalized delta")
+    ap.add_argument("--auto-threshold", action="store_true",
+                    help="Pick threshold as a quantile of |pred_norm|")
+    ap.add_argument("--quantile", type=float, default=0.9,
+                    help="Quantile (0..1) used when --auto-threshold is on")
     ap.add_argument("--api", default="http://macbook-server:8200")
     ap.add_argument("--symbol", default=None, help="Override symbol; else use model config")
     ap.add_argument("--period", type=int, default=None, help="Override period; else use model config")
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
-    ap.add_argument("--threshold", type=float, default=0.15, help="Signal threshold on normalized delta")
     ap.add_argument("--long-only", action="store_true")
     ap.add_argument("--init-usdt", type=float, default=10000.0)
     ap.add_argument("--fee-bps", type=float, default=2.0)
@@ -285,6 +300,17 @@ def main():
     else:  # delta_norm
         pred_price = prev_close + y_pred * (prev_atr + 1e-8)
 
+    # normalized prediction used for signal
+    pred_norm = (pred_price - prev_close) / (prev_atr + 1e-8)
+
+    if args.auto_threshold:
+        thr = float(np.quantile(np.abs(pred_norm), args.quantile))
+    else:
+        thr = args.threshold
+
+    rate = float((np.abs(pred_norm) > thr).mean())
+    print(f"[signal] threshold={thr:.6f}  hit_rate(|pred_norm|>thr)={rate:.3f}")
+
     # simulate one-bar trades with signals decided at end of t-1
     okx_open_s = okx["open"]
     okx_close_s = okx["close"]
@@ -294,7 +320,7 @@ def main():
         prev_close=prev_close,
         okx_open_series=okx_open_s,
         okx_close_series=okx_close_s,
-        threshold_norm=args.threshold,
+        threshold_norm=thr,          # <— use selected threshold
         target_mode=target_mode,
         prev_atr=prev_atr,
         init_usdt=args.init_usdt,
@@ -315,6 +341,16 @@ def main():
         plt.xlabel("Time"); plt.ylabel("USDT"); plt.legend(); plt.tight_layout()
         plt.savefig("equity_curve.png")
         print("Saved plot: equity_curve.png")
+
+    params_json = sanitize_for_json({
+        "threshold": thr,
+        "long_only": args.long_only,
+        "init_usdt": args.init_usdt,
+        "fee_bps": args.fee_bps,
+        "slip_bps": args.slip_bps,
+        "position_frac": args.position_frac
+    })
+    metrics_json = sanitize_for_json(stats)
 
     # -------- save summary to Postgres ----------
     with psycopg.connect(f"host={PG_HOST} port={PG_PORT} user={PG_USER} password={PG_PASSWORD} dbname={PG_DBNAME}") as conn, conn.cursor() as cur:
@@ -339,18 +375,15 @@ def main():
             symbol, period,
             bt.index.min().to_pydatetime() if not bt.empty else None,
             bt.index.max().to_pydatetime() if not bt.empty else None,
-            json.dumps({
-                "threshold": args.threshold,
-                "long_only": args.long_only,
-                "init_usdt": args.init_usdt,
-                "fee_bps": args.fee_bps,
-                "slip_bps": args.slip_bps,
-                "position_frac": args.position_frac
-            }),
-            json.dumps(stats)
+            json.dumps(params_json, allow_nan=False),
+            json.dumps(metrics_json, allow_nan=False)
         ))
         conn.commit()
+
         print("[db] backtest summary saved to ml_backtest")
+
+        if stats["num_trades"] == 0:
+            print("[warn] No trades fired. Try --threshold 0.01..0.05 or --auto-threshold --quantile 0.85")
         
 if __name__ == "__main__":
     main()
