@@ -148,61 +148,76 @@ def sanitize_for_json(obj):
     return obj
 
 # ----------------- trade simulator -----------------
-def backtest_long_short(times, pred_price, prev_close, okx_open_series, okx_close_series,
-                        threshold_norm, target_mode, prev_atr, init_usdt=10000,
-                        fee_bps=2.0, slip_bps=0.0, long_only=False, position_frac=1.0):
+def backtest_long_short(times, sig, okx_open_series, okx_close_series,
+                        init_usdt=10000, fee_bps=2.0, slip_bps=0.0,
+                        hold=1, position_frac=0.2):
     """
-    One-bar holding:
-      - Decision made at end of bar t-1.
-      - Enter at bar t OPEN, exit at bar t CLOSE.
-    Signal:
-      - If target is delta_norm: use y_pred directly.
-      - Else normalize: pred_norm = (pred_price - prev_close)/prev_atr.
+    Executes signals with a fixed holding period:
+      - At time t: if sig[t] != 0 and we're flat, ENTER at open_t
+      - EXIT after 'hold' bars at close_{t+hold-1} (or last available)
+      - Ignores overlapping signals while in a position
+    PnL includes fees and symmetric slippage on entry+exit.
     """
     fee = fee_bps / 10000.0
     slip = slip_bps / 10000.0
 
-    # normalized prediction for signal
-    if target_mode == "price":
-        pred_norm = (pred_price - prev_close) / (prev_atr + 1e-8)
-    else:  # delta or delta_norm reconstructed to price already -> recompute norm
-        pred_norm = (pred_price - prev_close) / (prev_atr + 1e-8)
-
-    sig = np.where(pred_norm > threshold_norm, 1, np.where(pred_norm < -threshold_norm, -1, 0))
-    if long_only:
-        sig = np.where(sig == 1, 1, 0)
-
-    # iterate trades
     equity = init_usdt
+    in_pos = False
+    pos_side = 0
+    exit_index = -1
+
     rows = []
+
+    # For fast access:
+    open_s = okx_open_series.reindex(times)
+    close_s = okx_close_series  # will index at exit time
+
     for i, t in enumerate(times):
-        s = int(sig[i])
-        if s == 0:
-            rows.append((t, equity, 0, np.nan, np.nan, 0.0))
-            continue
+        if not in_pos:
+            s = int(sig[i])
+            if s == 0:
+                rows.append((t, equity, 0, np.nan, np.nan, 0.0))
+                continue
 
-        # entry at bar t open, exit at bar t close
-        p_open = float(okx_open_series.loc[t])
-        p_close = float(okx_close_series.loc[t])
+            # ENTER
+            p_open = float(open_s.iloc[i])
+            notional = equity * position_frac
+            qty = notional / p_open
 
-        # position sizing
-        notional = equity * position_frac
-        qty = notional / p_open
+            # effective prices with slippage
+            p_open_eff = p_open * (1 + slip if s == 1 else 1 - slip)
 
-        # fees + slippage: assume both on entry & exit (symmetrically)
-        p_open_eff  = p_open  * (1 + slip if s==1 else 1 - slip)
-        p_close_eff = p_close * (1 - slip if s==1 else 1 + slip)
+            # book the entry cashflow immediately
+            cost_entry = qty * p_open_eff
+            # we don't change equity on entry; we realize PnL at exit (easier book-keeping)
+            in_pos = True
+            pos_side = s
+            exit_index = min(i + hold - 1, len(times) - 1)
+            rows.append((t, equity, s, p_open, np.nan, 0.0))
+        else:
+            # Are we exiting at this timestamp?
+            if i == exit_index:
+                t_exit = t
+                p_close = float(close_s.loc[t_exit])
+                qty = (equity * position_frac) / float(open_s.iloc[i - (hold - 1)])  # approximate same qty as entry
+                p_close_eff = p_close * (1 - slip if pos_side == 1 else 1 + slip)
 
-        cost_entry = qty * p_open_eff
-        cost_exit  = qty * p_close_eff
+                cost_entry = qty * float(open_s.iloc[i - (hold - 1)]) * (1 + slip if pos_side == 1 else 1 - slip)
+                cost_exit = qty * p_close_eff
 
-        if s == 1:  # long
-            pnl = (cost_exit - cost_entry) - fee * (cost_entry + cost_exit)
-        else:       # short
-            pnl = (cost_entry - cost_exit) - fee * (cost_entry + cost_exit)
+                if pos_side == 1:  # long
+                    pnl = (cost_exit - cost_entry) - fee * (cost_entry + cost_exit)
+                else:              # short
+                    pnl = (cost_entry - cost_exit) - fee * (cost_entry + cost_exit)
 
-        equity += pnl
-        rows.append((t, equity, s, p_open, p_close, pnl))
+                equity += pnl
+                rows.append((t_exit, equity, 0, np.nan, p_close, pnl))
+
+                in_pos = False
+                pos_side = 0
+                exit_index = -1
+            else:
+                rows.append((t, equity, pos_side, np.nan, np.nan, 0.0))
 
     bt = pd.DataFrame(rows, columns=["time","equity","signal","open","close","pnl"]).set_index("time")
     # metrics
@@ -213,9 +228,9 @@ def backtest_long_short(times, pred_price, prev_close, okx_open_series, okx_clos
         "final_equity": float(bt["equity"].iloc[-1]),
         "total_return_pct": float((bt["equity"].iloc[-1] / bt["equity"].iloc[0] - 1.0) * 100.0),
         "max_drawdown_pct": float(drawdown.min() * 100.0),
-        "num_trades": int((bt["signal"] != 0).sum()),
-        "avg_trade_pnl": float(bt.loc[bt["signal"] != 0, "pnl"].mean()),
-        "sharpe_like": float((ret.mean() / (ret.std() + 1e-9)) * np.sqrt(252*24*6))  # rough scaling
+        "num_trades": int((bt["signal"].diff().abs() > 0).sum()),  # rough count of entries
+        "avg_trade_pnl": float(bt.loc[bt["pnl"].abs() > 0, "pnl"].mean() if (bt["pnl"].abs() > 0).any() else 0.0),
+        "sharpe_like": float((ret.mean() / (ret.std() + 1e-9)) * np.sqrt(252*24*6)),
     }
     return bt, stats
 
@@ -223,12 +238,6 @@ def backtest_long_short(times, pred_price, prev_close, okx_open_series, okx_clos
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True, help="Folder with saved Keras model + scalers + config/features")
-    ap.add_argument("--threshold", type=float, default=0.03,  # was 0.15
-                help="Signal threshold on normalized delta")
-    ap.add_argument("--auto-threshold", action="store_true",
-                    help="Pick threshold as a quantile of |pred_norm|")
-    ap.add_argument("--quantile", type=float, default=0.9,
-                    help="Quantile (0..1) used when --auto-threshold is on")
     ap.add_argument("--api", default="http://macbook-server:8200")
     ap.add_argument("--symbol", default=None, help="Override symbol; else use model config")
     ap.add_argument("--period", type=int, default=None, help="Override period; else use model config")
@@ -238,8 +247,21 @@ def main():
     ap.add_argument("--init-usdt", type=float, default=10000.0)
     ap.add_argument("--fee-bps", type=float, default=2.0)
     ap.add_argument("--slip-bps", type=float, default=1.0)
-    ap.add_argument("--position-frac", type=float, default=1.0)
     ap.add_argument("--plot", action="store_true")
+    ap.add_argument("--position-frac", type=float, default=0.2)  # was 1.0
+    ap.add_argument("--signal-mode", choices=["open_ret", "norm_atr"], default="open_ret",
+                    help="Signal gating mode: predicted return vs open (recommended) or normalized delta vs ATR")
+    ap.add_argument("--auto-threshold", action="store_true",
+                    help="Pick threshold as a quantile of |signal| (open_ret or norm_atr)")
+    ap.add_argument("--quantile", type=float, default=0.9,
+                    help="Quantile used when --auto-threshold is on")
+    ap.add_argument("--threshold", type=float, default=0.0,
+                    help="Manual threshold; interpretation depends on --signal-mode "
+                        "(fraction for open_ret, not bps; e.g., 0.0005 = 5 bps)")
+    ap.add_argument("--min-edge-bps", type=float, default=5.0,
+                    help="Require predicted edge to exceed this AND costs (bps); e.g., 5 = 0.05%)")
+    ap.add_argument("--hold", type=int, default=1,
+                    help="Holding period in bars (>=1). 1 = enter at open_t, exit at close_t")
     args = ap.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -300,6 +322,41 @@ def main():
     else:  # delta_norm
         pred_price = prev_close + y_pred * (prev_atr + 1e-8)
 
+    # Align arrays to prediction timestamps
+    open_t = okx["open"].reindex(idx_pred).to_numpy()
+    prev_close = okx["close"].reindex(idx_pred).shift(1).bfill().to_numpy()  # may be unused in open_ret
+    atr_okx_series = atr(okx["high"], okx["low"], okx["close"], 14)
+    prev_atr = atr_okx_series.reindex(idx_pred).shift(1).bfill().to_numpy()
+
+    # Predicted open-return (this is what we monetize)
+    open_ret_pred = (pred_price - open_t) / open_t  # dimensionless (e.g., 0.0005 = +5 bps)
+
+    # Total round-trip cost in fraction (fees+slip both sides) plus a safety buffer
+    cost_frac = ((args.fee_bps + args.slip_bps) * 2.0) / 10000.0
+    buffer_frac = (args.min_edge_bps / 10000.0)
+
+    if args.signal_mode == "open_ret":
+        signal_series = open_ret_pred.copy()
+    else:  # norm_atr (kept for experiments)
+        signal_series = (pred_price - prev_close) / (prev_atr + 1e-8)
+
+    # Pick threshold
+    if args.auto_threshold:
+        thr = float(np.quantile(np.abs(signal_series), args.quantile))
+    else:
+        thr = float(args.threshold)
+
+    # Final gate: must beat BOTH the quantile/manual threshold AND the cost+buffer
+    gate = np.maximum(thr, cost_frac + buffer_frac)
+
+    sig = np.where(signal_series > gate,  1,
+        np.where(signal_series < -gate, -1, 0))
+    if args.long_only:
+        sig = np.where(sig == 1, 1, 0)
+
+    hit_rate = float((sig != 0).mean())
+    print(f"[signal] mode={args.signal_mode}  thr={thr:.6f}  cost+buffer={cost_frac+buffer_frac:.6f}  trade_rate={hit_rate:.3f}")
+
     # normalized prediction used for signal
     pred_norm = (pred_price - prev_close) / (prev_atr + 1e-8)
 
@@ -316,19 +373,16 @@ def main():
     okx_close_s = okx["close"]
     bt, stats = backtest_long_short(
         times=idx_pred,
-        pred_price=pred_price,
-        prev_close=prev_close,
+        sig=sig,
         okx_open_series=okx_open_s,
         okx_close_series=okx_close_s,
-        threshold_norm=thr,          # <— use selected threshold
-        target_mode=target_mode,
-        prev_atr=prev_atr,
         init_usdt=args.init_usdt,
         fee_bps=args.fee_bps,
         slip_bps=args.slip_bps,
-        long_only=args.long_only,
+        hold=args.hold,
         position_frac=args.position_frac
     )
+
 
     print("\n=== Backtest summary ===")
     for k, v in stats.items():
