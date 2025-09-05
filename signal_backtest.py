@@ -324,12 +324,16 @@ def main():
 
     # Align arrays to prediction timestamps
     open_t = okx["open"].reindex(idx_pred).to_numpy()
-    prev_close = okx["close"].reindex(idx_pred).shift(1).bfill().to_numpy()  # may be unused in open_ret
     atr_okx_series = atr(okx["high"], okx["low"], okx["close"], 14)
-    prev_atr = atr_okx_series.reindex(idx_pred).shift(1).bfill().to_numpy()
+    prev_close = okx["close"].reindex(idx_pred).shift(1).ffill().to_numpy()
+    prev_atr   = atr_okx_series.reindex(idx_pred).shift(1).ffill().to_numpy()   
 
     # Predicted open-return (this is what we monetize)
     open_ret_pred = (pred_price - open_t) / open_t  # dimensionless (e.g., 0.0005 = +5 bps)
+
+    absr = np.abs(open_ret_pred)
+    pcts = np.percentile(absr, [50, 75, 90, 95, 97, 99])  # bps = value*1e4
+    print("[debug] |open_ret_pred| percentiles (bps):", (pcts*1e4).round(3).tolist())
 
     # Total round-trip cost in fraction (fees+slip both sides) plus a safety buffer
     cost_frac = ((args.fee_bps + args.slip_bps) * 2.0) / 10000.0
@@ -366,7 +370,8 @@ def main():
         thr = args.threshold
 
     rate = float((np.abs(pred_norm) > thr).mean())
-    print(f"[signal] threshold={thr:.6f}  hit_rate(|pred_norm|>thr)={rate:.3f}")
+    # print(f"[signal] threshold={thr:.6f}  hit_rate(|pred_norm|>thr)={rate:.3f}")
+    print(f"[signal] mode={args.signal_mode}  thr={thr:.6f}  cost+buffer={cost_frac+buffer_frac:.6f}  trade_rate={hit_rate:.3f}")
 
     # simulate one-bar trades with signals decided at end of t-1
     okx_open_s = okx["open"]

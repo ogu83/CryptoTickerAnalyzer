@@ -5,3 +5,5 @@ python .\signal_backtest.py --model-dir models/okx_ETH-USDT_10_dnorm_w64 --api h
 python .\signal_backtest.py --model-dir models\okx_ETH-USDT_10_dnorm_w64 --api http://macbook-server:8200 --symbol ETH-USDT --period 10 --start 2025-08-28T00:00:00Z --end 2025-08-30T00:00:00Z --auto-threshold --quantile 0.85 --long-only --init-usdt 10000 --fee-bps 2 --slip-bps 1 --plot
 
 python .\signal_backtest.py --model-dir models\okx_ETH-USDT_10_dnorm_w64 --api http://macbook-server:8200 --symbol ETH-USDT --period 10 --start 2025-08-28T00:00:00Z --end 2025-09-05T00:00:00Z --signal-mode open_ret --auto-threshold --quantile 0.95 --min-edge-bps 5 --long-only --position-frac 0.2 --hold 1 --fee-bps 2 --slip-bps 1 --plot
+
+python .\signal_backtest.py --model-dir models\okx_ETH-USDT_10_dnorm_w64 --api http://macbook-server:8200 --symbol ETH-USDT --period 10 --start 2025-08-28T00:00:00Z --end 2025-09-05T00:00:00Z --signal-mode open_ret --auto-threshold --quantile 0.97 --min-edge-bps 0 --hold 2 --position-frac 0.1 --fee-bps 2 --slip-bps 1 --plot
