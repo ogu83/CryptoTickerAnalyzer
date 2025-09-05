@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List
+from psycopg.rows import dict_row
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,6 +85,99 @@ def root():
             "/tick-chart?symbol=BTC-USDT&period=1000&start=2025-08-26T00:00:00Z&end=2025-08-27T00:00:00Z"
         ]
     }
+
+@app.get("/ob-top")
+def get_orderbook_top(
+    symbol: str,
+    start: str | None = Query(None, description="ISO datetime (inclusive)"),
+    end: str   | None = Query(None, description="ISO datetime (exclusive)"),
+    step: int = Query(1, ge=1, description="Return every Nth snapshot (downsample)"),
+) -> JSONResponse:
+    schema = PG_DBO_SCHEMA_OKX  # OB is OKX-only here
+
+    # OKX symbol fix-up
+    if "-" not in symbol:
+        symbol = (symbol[:-4] + "-" + symbol[-4:]) if len(symbol) > 6 else (symbol[:-3] + "-" + symbol[-3:])
+
+    start_dt = _parse_dt(start)
+    end_dt   = _parse_dt(end)
+
+    params: List[Any] = [symbol]
+    # IMPORTANT: filter by the base column names (no alias here)
+    where = ["inst_id = %s"]
+    if start_dt is not None:
+        where.append("ts >= %s"); params.append(start_dt)
+    if end_dt is not None:
+        where.append("ts < %s");  params.append(end_dt)
+
+    sql = f"""
+    with h as (
+      select id, inst_id, ts
+      from {schema}.orderbook_header
+      where {" and ".join(where)}
+      order by ts
+    ),
+    bb as (
+      select distinct on (i.orderbook_id)
+             i.orderbook_id, i.price as bid_px, i.qty as bid_sz, i.order_count as bid_ct
+      from {schema}.orderbook_item i
+      join h on h.id = i.orderbook_id
+      where i.side = 'B'
+      order by i.orderbook_id, i.price desc
+    ),
+    ba as (
+      select distinct on (i.orderbook_id)
+             i.orderbook_id, i.price as ask_px, i.qty as ask_sz, i.order_count as ask_ct
+      from {schema}.orderbook_item i
+      join h on h.id = i.orderbook_id
+      where i.side = 'A'
+      order by i.orderbook_id, i.price asc
+    )
+    select h.ts, h.inst_id, bb.bid_px, bb.bid_sz, bb.bid_ct, ba.ask_px, ba.ask_sz, ba.ask_ct
+    from h
+    left join bb on bb.orderbook_id = h.id
+    left join ba on ba.orderbook_id = h.id
+    order by h.ts
+    """
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+    except psycopg.Error as e:
+        # psycopg3 may not have .pgerror; use diag/sqlstate when available
+        detail = getattr(e, "pgerror", None) or getattr(getattr(e, "diag", None), "message_primary", None) or str(e)
+        raise HTTPException(status_code=500, detail=f"Database error: {detail}")
+
+    # downsample if requested
+    if step > 1:
+        rows = rows[::step]
+
+    def fnum(x: Any) -> float | None:
+        if x is None: return None
+        if isinstance(x, Decimal): return float(x)
+        try: return float(x)
+        except Exception: return None
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        bid_px = fnum(r["bid_px"]); ask_px = fnum(r["ask_px"])
+        bid_sz = fnum(r["bid_sz"]); ask_sz = fnum(r["ask_sz"])
+        mid    = (bid_px + ask_px) / 2.0 if (bid_px is not None and ask_px is not None) else None
+        spread = (ask_px - bid_px) if (bid_px is not None and ask_px is not None) else None
+        imb    = ((bid_sz - ask_sz) / (bid_sz + ask_sz)) if (bid_sz and ask_sz and (bid_sz + ask_sz) != 0) else None
+        micro  = ((bid_px * ask_sz + ask_px * bid_sz) / (bid_sz + ask_sz)) if (bid_px and ask_px and bid_sz and ask_sz and (bid_sz + ask_sz) != 0) else None
+
+        out.append({
+            "time": _to_iso_z(r["ts"]),
+            "inst_id": r["inst_id"],
+            "bid_px": bid_px, "bid_sz": bid_sz, "bid_ct": r["bid_ct"],
+            "ask_px": ask_px, "ask_sz": ask_sz, "ask_ct": r["ask_ct"],
+            "mid": mid, "spread": spread, "imbalance": imb, "microprice": micro,
+        })
+
+    return JSONResponse(content=out)
 
 @app.get("/tick-chart")
 def get_tick_chart(
