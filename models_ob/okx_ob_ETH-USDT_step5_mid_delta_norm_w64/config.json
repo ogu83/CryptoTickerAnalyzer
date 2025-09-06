@@ -1,0 +1,8 @@
+{
+  "symbol": "ETH-USDT",
+  "target": "mid_delta_norm",
+  "window": 64,
+  "step": 5,
+  "start": null,
+  "end": null
+}
