@@ -164,6 +164,8 @@ def main():
                     help="Minimum predicted edge (bps) beyond fee+slippage+buffer")
     ap.add_argument("--edge-buffer-bps", type=float, default=1.0,
                     help="Extra buffer to clear microstructure noise")
+    ap.add_argument("--max-trades-per-hour", type=int, default=None,
+                help="Keep only the top-|edge| anomalies per hour after all gates")
 
 
     args = ap.parse_args()
@@ -256,6 +258,8 @@ def main():
             # will hold inside backtest; add external cooldown after exit
             cool = 0  # leave at 0; cooldown is applied after realized trades in backtest
 
+    edge_ser = np.zeros_like(sig, dtype=float)  # Ensure edge_ser is always defined
+
     if args.reg_model_dir:
         reg_dir = Path(args.reg_model_dir)
         # load regressor package
@@ -285,14 +289,50 @@ def main():
         # convert to predicted edge in bps at the prior bar (causal)
         atr_prev = F["atr_mid"].loc[idx_r].shift(1).reindex(idx_r).values
         mid_prev = F["mid"].loc[idx_r].shift(1).reindex(idx_r).values
-        edge_bps = (y_hat * atr_prev) * 1e4 / (mid_prev + 1e-12)  # (delta_norm * ATR) -> price -> bps
-        edge_ser = pd.Series(edge_bps, index=idx_r).reindex(idx).fillna(0.0).values
+        edge_bps = y_hat * atr_prev * 1e4
+        finite = np.isfinite(edge_bps)
+        print(
+            f"[diag] edge_bps abs p50={np.nanmedian(np.abs(edge_bps)):.3f}, "
+            f"p90={np.nanquantile(np.abs(edge_bps[finite]), 0.90):.3f}, "
+            f"p99={np.nanquantile(np.abs(edge_bps[finite]), 0.99):.3f}"
+        )
+
+        edge_ser = (pd.Series(edge_bps, index=idx_r)
+                    .reindex(idx)
+                    .where(lambda s: np.isfinite(s), 0.0)  # non-finite -> 0
+                    .values)
+
+        costs_bps = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps
+
+        # require direction consistency and edge > costs+buffer, but only where finite
+        finite_gate = np.isfinite(edge_ser)
+        dir_ok = np.zeros_like(sig, dtype=bool)
+        dir_ok[finite_gate] = np.sign(edge_ser[finite_gate]) == sig[finite_gate]
+
+        mag_ok = np.zeros_like(sig, dtype=bool)
+        mag_ok[finite_gate] = np.abs(edge_ser[finite_gate]) >= (costs_bps + args.min_edge_bps)
+
+        sig = np.where((sig != 0) & dir_ok & mag_ok, sig, 0)
 
         # require direction consistency and edge > costs+buffer
         costs_bps = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps
         dir_ok  = np.sign(np.asarray(edge_ser)) == np.asarray(sig)
         mag_ok  = np.abs(np.asarray(edge_ser)) >= (costs_bps + args.min_edge_bps)
         sig = np.where((sig != 0) & dir_ok & mag_ok, sig, 0)
+
+    if args.max_trades_per_hour:
+        hour = pd.to_datetime(idx).floor("H")
+        score = np.abs(np.asarray(edge_ser)) * (np.asarray(sig) != 0)
+        keep = np.zeros_like(sig, dtype=bool)
+        for h in np.unique(hour):
+            m = (hour == h)
+            where = np.where(m)[0]
+            if where.size == 0: 
+                continue
+            top = np.argsort(-score[where])[:args.max_trades_per_hour]
+            keep[where[top]] = True
+        sig = np.where(keep, sig, 0)
+
 
     bt, stats = backtest(idx, sig, okx_open, okx_close,
                          init_usdt=args.init_usdt, fee_bps=args.fee_bps, slip_bps=args.slip_bps,
@@ -308,6 +348,32 @@ def main():
         plt.title(f"Equity Curve • {model_dir.name} • {args.symbol} • thr@q{args.quantile}")
         plt.xlabel("Time"); plt.ylabel("USDT"); plt.legend(); plt.tight_layout()
         plt.savefig("ob_anom_equity_curve.png"); print("Saved plot: ob_anom_equity_curve.png")
+
+        def _count_nonzero(x): 
+            return int(np.count_nonzero(x))
+
+        print(f"[diag] total windows: {len(idx)}")
+        print(f"[diag] anomalies>thr: {_count_nonzero(anom)}")
+
+        # After consec confirmation:
+        print(f"[diag] consec>={args.consec}: {_count_nonzero(anom_confirmed)}")
+
+        # After spread cap:
+        print(f"[diag] spread<=cap: {_count_nonzero(ok_spread)}")
+        mask_after_spread = anom_confirmed & ok_spread
+        print(f"[diag] anom∧spread: {_count_nonzero(mask_after_spread)}")
+
+        # After direction:
+        cand_dir = np.where(mask_after_spread, np.sign(dir_sig)!=0, 0)
+        print(f"[diag] directionable: {_count_nonzero(cand_dir)}")
+
+        # After regressor edge (only if provided):
+        if args.reg_model_dir:
+            costs_bps = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps
+            print(f"[diag] costs_bps≈{costs_bps:.1f}, min_edge_bps={args.min_edge_bps:.1f}")
+            print(f"[diag] |edge|>=costs+min_edge: {_count_nonzero(np.abs(edge_ser) >= (costs_bps + args.min_edge_bps))}")
+            print(f"[diag] dir ok: {_count_nonzero(np.sign(edge_ser) == sig)}")
+
 
     # optional: write to DB (same table you used for ML backtests)
     try:

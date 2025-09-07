@@ -1,0 +1,12 @@
+python ob_anomaly_backtest.py `
+  --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 `
+  --reg-model-dir models_ob\okx_ob_ETH-USDT_step5_mid_delta_norm_w64 `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --usequantile --quantile 0.995 `
+  --consec 2 --cooldown 15 `
+  --dir-alpha 0.5 --tilt-ema 5 `
+  --hold 3 --position-frac 0.05 `
+  --fee-bps 2 --slip-bps 1 `
+  --spread-cap-bps 2.5 `
+  --min-edge-bps 0 --edge-buffer-bps 0.5 `
+  --plot
