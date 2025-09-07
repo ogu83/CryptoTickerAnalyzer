@@ -39,14 +39,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     mid, spread = df["mid"], df["spread"]
 
     out["spread_bps"] = (spread / mid * 1e4).clip(lower=0).fillna(0.0)
-    out["imb"] = df["imbalance"].clip(-1,1).fillna(0.0)
+    out["imb"] = df["imbalance"].clip(-1, 1).fillna(0.0)
 
     out["micro_tilt"] = (df["microprice"] - mid) / (spread.replace(0, np.nan))
     out["micro_tilt"] = out["micro_tilt"].replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
     out["dt_sec"] = out.index.to_series().diff().dt.total_seconds().fillna(0.0).clip(0, 5.0)
 
-    out["lr_mid"] = logret(mid).fillna(0.0)
+    out["lr_mid"] = np.log(mid).diff().fillna(0.0)
     out["vol20_mid"] = out["lr_mid"].rolling(20, min_periods=10).std().bfill().fillna(0.0)
 
     for k in [1, 2, 3, 5]:
@@ -55,15 +55,17 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         out[f"lr_mid_lag{k}"] = out["lr_mid"].shift(k)
         out[f"sbps_lag{k}"]  = out["spread_bps"].shift(k)
 
-    # <<< THIS WAS MISSING >>>
-    out["atr_mid"] = atr_like_mid(mid, win=50)
+    out["atr_mid"] = (np.log(mid).diff().abs().ewm(alpha=1/50, adjust=False).mean()
+                      .bfill().fillna(0.0))
 
-    # Clean and keep pricing columns for the backtester
+    out["spread"] = spread  # <<< add this line so 'spread' exists later
+
     out = out.dropna()
     out["mid"] = mid.reindex(out.index)
-    out["open"] = out["mid"]          # proxy: mid as open
-    out["close"] = out["mid"]         # proxy: mid as close
+    out["open"] = out["mid"]
+    out["close"] = out["mid"]
     return out
+
 
 def make_sequences(F: pd.DataFrame, cols: list, window: int):
     F = F[cols]
@@ -148,6 +150,22 @@ def main():
     ap.add_argument("--slip-bps", type=float, default=1.0)
     ap.add_argument("--init-usdt", type=float, default=10_000)
     ap.add_argument("--plot", action="store_true")
+    ap.add_argument("--usequantile", action="store_true", help="Use saved train quantile threshold")
+    ap.add_argument("--z-thr", type=float, default=3.0, help="Z-score threshold if not using quantile")
+    ap.add_argument("--consec", type=int, default=3, help="require N consecutive anomaly bars")
+    ap.add_argument("--cooldown", type=int, default=10, help="bars to wait after closing a trade")
+    ap.add_argument("--spread-cap-bps", type=float, default=5.0, help="skip bars with spread above this")
+    ap.add_argument("--long-only", action="store_true")
+    ap.add_argument("--short-only", action="store_true")
+    ap.add_argument("--tilt-ema", type=int, default=3, help="EMA window for micro_tilt direction")
+    ap.add_argument("--reg-model-dir", default=None,
+                help="Optional: models_ob/... directory of an OB regressor (e.g., okx_ob_ETH-USDT_step5_mid_delta_norm_w64)")
+    ap.add_argument("--min-edge-bps", type=float, default=3.0,
+                    help="Minimum predicted edge (bps) beyond fee+slippage+buffer")
+    ap.add_argument("--edge-buffer-bps", type=float, default=1.0,
+                    help="Extra buffer to clear microstructure noise")
+
+
     args = ap.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -171,20 +189,110 @@ def main():
     X_raw = np.array([ feats.values[t-window:t,:] for t in range(window, len(feats)) ])
     idx = feats.index[window:]
 
+    thr_file = model_dir / "thresholds.json"
+    saved = json.loads(thr_file.read_text()) if thr_file.exists() else None
+
     Xs = fs.transform(X_raw.reshape(-1, X_raw.shape[-1])).reshape(X_raw.shape)
     Xhat = model.predict(Xs, verbose=0)
     err = np.mean((Xs - Xhat)**2, axis=(1,2))
-    # training quantile not available here; approximate using in-sample lower chunk
-    thr = float(np.quantile(err[:max(1000, len(err)//2)], args.quantile))
-    print(f"[anomaly] threshold (q={args.quantile:.2f}) = {thr:.6e}")
+
+    if args.usequantile and saved:
+        qkey = f"{args.quantile:.3f}"
+        thr = float(saved["quantiles"].get(qkey, np.quantile(err, args.quantile)))
+    else:
+        mu  = (saved["mu"] if saved else float(err.mean()))
+        sig = (saved["sigma"] if saved else float(err.std() + 1e-12))
+        thr = mu + args.z_thr * sig
+
+    print(f"[anomaly] thr = {thr:.6e}  (source={'train-quantile' if args.usequantile and saved else 'z-score'})")
+    anom = err > thr
 
     # direction: sign(micro_tilt + alpha*imb) at the last frame
     mt = F["micro_tilt"].values[window:]
     imb = F["imb"].values[window:]
-    dir_sig = np.sign(mt + args.dir_alpha * imb)
+
+    # EMA of micro_tilt for a more stable direction
+    mt_series = pd.Series(F["micro_tilt"].values, index=F.index).ewm(span=args.tilt_ema, adjust=False).mean()
+    mt_s = mt_series.values[window:]
+    dir_sig = np.sign(mt_s + args.dir_alpha * imb)
     dir_sig = np.where(np.isnan(dir_sig), 0, dir_sig)
 
+    # optional long/short only
+    if args.long_only:
+        dir_sig = np.where(dir_sig < 0, 0, dir_sig)
+    elif args.short_only:
+        dir_sig = np.where(dir_sig > 0, 0, dir_sig)
+
+    # cost guard: skip wide-spread bars
+    spread_bps = (np.array(F["spread"].values[window:], dtype=float) / np.array(F["mid"].values[window:], dtype=float) * 1e4)
+    ok_spread = spread_bps <= args.spread_cap_bps
+
     sig = np.where(err > thr, dir_sig, 0)
+
+    # require N consecutive anomalies
+    if args.consec > 1:
+        from numpy.lib.stride_tricks import sliding_window_view as swv
+        w = min(args.consec, len(anom))
+        if w > 1:
+            sw = swv(anom.astype(int), window_shape=w)
+            confirmed = (sw.sum(axis=1) == w).astype(bool)
+            anom_confirmed = np.r_[np.zeros(w-1, dtype=bool), confirmed]
+        else:
+            anom_confirmed = anom
+    else:
+        anom_confirmed = anom
+
+    raw_sig = np.where(anom_confirmed & ok_spread, dir_sig, 0)
+
+    # cooldown: prevent immediate re-entries
+    sig = raw_sig.copy()
+    cool = 0
+    for i in range(len(sig)):
+        if cool > 0:
+            sig[i] = 0
+            cool -= 1
+            continue
+        if sig[i] != 0:
+            # will hold inside backtest; add external cooldown after exit
+            cool = 0  # leave at 0; cooldown is applied after realized trades in backtest
+
+    if args.reg_model_dir:
+        reg_dir = Path(args.reg_model_dir)
+        # load regressor package
+        reg = keras.models.load_model((reg_dir / "model.keras").as_posix())
+        reg_scaler = joblib.load(reg_dir / "feature_scaler.pkl")
+        reg_cols = json.loads((reg_dir / "features.json").read_text())
+        reg_cfg  = json.loads((reg_dir / "config.json").read_text())
+        reg_window = int(reg_cfg["window"])
+
+        # build regressor sequences on the SAME features frame F
+        # (make sure reg_cols are present; if not, fail quick)
+        missing = [c for c in reg_cols if c not in F.columns]
+        if missing:
+            raise SystemExit(f"Regressor expects features {missing} not present in F.")
+
+        Fr = F[reg_cols].dropna()
+        Vr = Fr.values
+        if len(Fr) <= reg_window:
+            raise SystemExit("Not enough rows to build regressor sequences.")
+        Xr = np.array([Vr[t-reg_window:t, :] for t in range(reg_window, len(Fr))])
+        idx_r = Fr.index[reg_window:]
+
+        # scale and predict normalized delta (your OB model outputs next delta_norm)
+        Xr_s = reg_scaler.transform(Xr.reshape(-1, Xr.shape[-1])).reshape(Xr.shape)
+        y_hat = reg.predict(Xr_s, verbose=0).squeeze()  # shape (N,)
+
+        # convert to predicted edge in bps at the prior bar (causal)
+        atr_prev = F["atr_mid"].loc[idx_r].shift(1).reindex(idx_r).values
+        mid_prev = F["mid"].loc[idx_r].shift(1).reindex(idx_r).values
+        edge_bps = (y_hat * atr_prev) * 1e4 / (mid_prev + 1e-12)  # (delta_norm * ATR) -> price -> bps
+        edge_ser = pd.Series(edge_bps, index=idx_r).reindex(idx).fillna(0.0).values
+
+        # require direction consistency and edge > costs+buffer
+        costs_bps = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps
+        dir_ok  = np.sign(np.asarray(edge_ser)) == np.asarray(sig)
+        mag_ok  = np.abs(np.asarray(edge_ser)) >= (costs_bps + args.min_edge_bps)
+        sig = np.where((sig != 0) & dir_ok & mag_ok, sig, 0)
 
     bt, stats = backtest(idx, sig, okx_open, okx_close,
                          init_usdt=args.init_usdt, fee_bps=args.fee_bps, slip_bps=args.slip_bps,

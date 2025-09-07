@@ -127,6 +127,21 @@ def main():
     out_dir = Path(args.save_dir) / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- save thresholds learned on training errors ---
+    thresh = {
+        "mu": float(err_tr.mean()),
+        "sigma": float(err_tr.std()),
+        "quantiles": {
+            "0.95": float(np.quantile(err_tr, 0.95)),
+            "0.975": float(np.quantile(err_tr, 0.975)),
+            "0.99": float(np.quantile(err_tr, 0.99)),
+            "0.995": float(np.quantile(err_tr, 0.995)),
+            "0.999": float(np.quantile(err_tr, 0.999)),
+        }
+    }
+    with open(out_dir / "thresholds.json", "w") as f:
+        json.dump(thresh, f, indent=2)
+
     model_path = out_dir / "model.keras"
     model.save(model_path.as_posix())
     joblib.dump(fs, out_dir / "feature_scaler.pkl")
