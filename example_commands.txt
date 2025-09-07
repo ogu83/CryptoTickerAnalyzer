@@ -12,4 +12,5 @@ python train_orderbook.py --symbol ETH-USDT --window 64 --epochs 40 --target mid
 
 
 python train_ob_anomaly.py --symbol ETH-USDT --window 64 --epochs 40 --step 5 --plot
+
 python ob_anomaly_backtest.py --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 --api http://macbook-server:8200 --symbol ETH-USDT --step 5 --quantile 0.995 --dir-alpha 0.5 --hold 2 --position-frac 0.1 --fee-bps 2 --slip-bps 1 --plot

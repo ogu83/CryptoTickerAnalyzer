@@ -27,27 +27,42 @@ def fetch_ob(api, symbol, start=None, end=None, step=1) -> pd.DataFrame:
     for c in num_cols: df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna()
 
-def logret(x: pd.Series): return np.log(x).diff()
+def logret(x: pd.Series): 
+    return np.log(x).diff()
+
+def atr_like_mid(mid: pd.Series, win=50):
+    lr = logret(mid).abs()
+    return lr.ewm(alpha=1/win, adjust=False).mean().bfill().fillna(0.0)
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     mid, spread = df["mid"], df["spread"]
+
     out["spread_bps"] = (spread / mid * 1e4).clip(lower=0).fillna(0.0)
     out["imb"] = df["imbalance"].clip(-1,1).fillna(0.0)
-    out["micro_tilt"] = (df["microprice"] - mid) / (spread.replace(0,np.nan))
-    out["micro_tilt"] = out["micro_tilt"].replace([np.inf,-np.inf], 0.0).fillna(0.0)
-    out["dt_sec"] = out.index.to_series().diff().dt.total_seconds().fillna(0.0).clip(0,5.0)
+
+    out["micro_tilt"] = (df["microprice"] - mid) / (spread.replace(0, np.nan))
+    out["micro_tilt"] = out["micro_tilt"].replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    out["dt_sec"] = out.index.to_series().diff().dt.total_seconds().fillna(0.0).clip(0, 5.0)
+
     out["lr_mid"] = logret(mid).fillna(0.0)
     out["vol20_mid"] = out["lr_mid"].rolling(20, min_periods=10).std().bfill().fillna(0.0)
-    for k in [1,2,3,5]:
-        out[f"imb_lag{k}"]  = out["imb"].shift(k)
-        out[f"tilt_lag{k}"] = out["micro_tilt"].shift(k)
+
+    for k in [1, 2, 3, 5]:
+        out[f"imb_lag{k}"]   = out["imb"].shift(k)
+        out[f"tilt_lag{k}"]  = out["micro_tilt"].shift(k)
         out[f"lr_mid_lag{k}"] = out["lr_mid"].shift(k)
-        out[f"sbps_lag{k}"] = out["spread_bps"].shift(k)
+        out[f"sbps_lag{k}"]  = out["spread_bps"].shift(k)
+
+    # <<< THIS WAS MISSING >>>
+    out["atr_mid"] = atr_like_mid(mid, win=50)
+
+    # Clean and keep pricing columns for the backtester
     out = out.dropna()
-    out["mid"] = mid.reindex(out.index)      # keep for pricing
-    out["open"] = out["mid"]                  # proxy (no separate open, so use mid as open/close)
-    out["close"] = out["mid"]
+    out["mid"] = mid.reindex(out.index)
+    out["open"] = out["mid"]          # proxy: mid as open
+    out["close"] = out["mid"]         # proxy: mid as close
     return out
 
 def make_sequences(F: pd.DataFrame, cols: list, window: int):
@@ -143,8 +158,12 @@ def main():
     ob = fetch_ob(args.api, args.symbol, args.start, args.end, step=args.step)
     F = build_features(ob)  # includes mid/open/close at the end
     okx_open = F["open"]; okx_close = F["close"]
-    feats = F[cols].dropna()
-    # align
+    missing = [c for c in cols if c not in F.columns]
+    if missing:
+        raise SystemExit(f"Model expects features {missing} that are not present. "
+                        f"Available columns: {list(F.columns)}")
+
+    feats = F[cols].dropna()    # align
     F = F.reindex(feats.index)
 
     # make sequences
