@@ -186,6 +186,15 @@ def main():
     # (Optional) suggest lowercase window in help; 'H' -> 'h'
     ap.add_argument("--roll-window", default="2h",
                     help="Rolling window (e.g. '2h', '30min') for rolling quantile.")
+    
+    ap.add_argument("--side-persist", type=int, default=2,
+                    help="Require direction sign stability over last N bars (after tilt EMA).")
+
+    ap.add_argument("--auto-edge-scale", type=float, default=None,
+                        help="If set (e.g. 0.90), multiply edges by s where "
+                            "s = quantile(min_edge / (|edge|+1e-9), q).")
+    ap.add_argument("--min-pass-rate", type=float, default=None,
+                    help="Target fraction of bars that should satisfy |edge|>=min_edge after scaling (0..1).")
 
 
 
@@ -257,6 +266,18 @@ def main():
         dir_sig = np.where(dir_sig < 0, 0, dir_sig)
     elif args.short_only:
         dir_sig = np.where(dir_sig > 0, 0, dir_sig)
+
+    # --- side persistence: require stable sign over last N bars ---
+    if args.side_persist > 1:
+        s = np.sign(mt_s + args.dir_alpha * imb)
+        from numpy.lib.stride_tricks import sliding_window_view as swv
+        w = min(args.side_persist, len(s))
+        if w > 1:
+            sw = swv(s, window_shape=w)           # shape (N-w+1, w)
+            same = (np.min(sw, axis=1) == np.max(sw, axis=1)) & (np.min(sw, axis=1) != 0)
+            stable = np.r_[np.zeros(w-1, dtype=bool), same]
+            dir_sig = np.where(stable, dir_sig, 0)
+
 
     # cost guard: skip wide-spread bars
     spread_bps = (np.array(F["spread"].values[window:], dtype=float) / np.array(F["mid"].values[window:], dtype=float) * 1e4)
@@ -369,6 +390,10 @@ def main():
             # legacy: scalar min-edge on top of costs
             min_edge_vec = base_costs_bps + args.min_edge_bps
 
+        # Optional volatility (regime) filter using ATR(mid) in bps
+        atr_bps = (F["atr_mid"].reindex(idx).values * 1e4)
+        regime_ok = np.ones_like(atr_bps, dtype=bool)
+
         if args.auto_min_edge:
             me = pd.Series(min_edge_vec, index=idx)
             print("[diag] dynamic min_edge bps: "
@@ -389,21 +414,52 @@ def main():
         mag_ok[finite_gate] = np.abs(edge_ser[finite_gate]) >= min_edge_vec[finite_gate]
 
         # Final regressor gate:
-        sig = np.where((sig != 0) & dir_ok & mag_ok, sig, 0)
+        # ---------- NEW: automatic scaling to meet gate ----------
+        # We only look at bars where we had a direction and finite edge
+        finite_gate = np.isfinite(edge_ser)
+        cand_mask = (np.asarray(sig) != 0) & finite_gate
+        if np.any(cand_mask):
+           abs_edge = np.abs(edge_ser[cand_mask])
+           need     = (min_edge_vec[cand_mask] / (abs_edge + 1e-9))
+
+           # (1) Quantile-based single-shot calibration
+           if args.auto_edge_scale is not None:
+               s = float(np.nanquantile(need, args.auto_edge_scale))
+               if np.isfinite(s) and s > 0:
+                   edge_ser *= s
+                   print(f"[cal] auto-edge-scale q={args.auto_edge_scale:.2f} => ×{s:.3f}")
+
+           # (2) Optional minimal pass-rate: relax further until target met
+           if args.min_pass_rate is not None and 0.0 < args.min_pass_rate < 1.0:
+               # Compute current pass after any scaling
+               abs_edge2 = np.abs(edge_ser[cand_mask])
+               pass_now = np.nanmean(abs_edge2 >= min_edge_vec[cand_mask])
+               if not np.isnan(pass_now) and pass_now < args.min_pass_rate:
+                   # scale so that the 'min_pass_rate' quantile of required factors is achieved
+                   s2 = float(np.nanquantile(need, args.min_pass_rate))
+                   if np.isfinite(s2) and s2 > 0:
+                       edge_ser *= s2
+                       print(f"[cal] min-pass-rate={args.min_pass_rate:.2f} => extra ×{s2:.3f}")
+
+           # Recompute direction & magnitude gates after scaling
+           dir_ok[finite_gate] = np.sign(edge_ser[finite_gate]) == sig[finite_gate]
+           mag_ok[finite_gate] = np.abs(edge_ser[finite_gate]) >= min_edge_vec[finite_gate]
+           sig = np.where((sig != 0) & dir_ok & mag_ok & regime_ok, sig, 0)
 
     if args.max_trades_per_hour:
         hour = pd.to_datetime(idx).floor("H")
-        score = np.abs(np.asarray(edge_ser)) * (np.asarray(sig) != 0)
+        # prefer bars with bigger (edge - min_edge), never below 0
+        excess = np.maximum(np.abs(edge_ser) - min_edge_vec, 0.0)
+        score = excess * (np.asarray(sig) != 0)
         keep = np.zeros_like(sig, dtype=bool)
         for h in np.unique(hour):
             m = (hour == h)
             where = np.where(m)[0]
-            if where.size == 0: 
+            if where.size == 0:
                 continue
             top = np.argsort(-score[where])[:args.max_trades_per_hour]
             keep[where[top]] = True
         sig = np.where(keep, sig, 0)
-
 
     bt, stats = backtest(idx, sig, okx_open, okx_close,
                          init_usdt=args.init_usdt, fee_bps=args.fee_bps, slip_bps=args.slip_bps,
