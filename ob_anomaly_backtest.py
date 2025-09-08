@@ -166,6 +166,27 @@ def main():
                     help="Extra buffer to clear microstructure noise")
     ap.add_argument("--max-trades-per-hour", type=int, default=None,
                 help="Keep only the top-|edge| anomalies per hour after all gates")
+    
+    # --- anomaly threshold as rolling quantile ---
+    ap.add_argument("--roll-quantile", type=float, default=None,
+                    help="If set (e.g. 0.90), use rolling quantile of reconstruction error as the anomaly threshold.")
+    # ap.add_argument("--roll-window", default="2H",
+    #                 help="Pandas offset window for rolling threshold (e.g. '2H', '30min'). Used only with --roll-quantile.")
+
+    # --- dynamic min-edge (cost-aware) ---
+    ap.add_argument("--auto-min-edge", action="store_true",
+                    help="Use per-bar min edge = (2*fee + 2*slip + edge_buffer) + k_spread * spread_bps.")
+    ap.add_argument("--k-spread", type=float, default=0.5,
+                    help="Coefficient applied to current spread (in bps) when --auto-min-edge is set.")
+        
+    # --- add CLI flag near the other args ---
+    ap.add_argument("--edge-scale", type=float, default=1.0,
+                    help="Multiply predicted edge (bps) by this factor for calibration.")
+
+    # (Optional) suggest lowercase window in help; 'H' -> 'h'
+    ap.add_argument("--roll-window", default="2h",
+                    help="Rolling window (e.g. '2h', '30min') for rolling quantile.")
+
 
 
     args = ap.parse_args()
@@ -207,7 +228,19 @@ def main():
         thr = mu + args.z_thr * sig
 
     print(f"[anomaly] thr = {thr:.6e}  (source={'train-quantile' if args.usequantile and saved else 'z-score'})")
-    anom = err > thr
+    err_s = pd.Series(err, index=pd.to_datetime(idx))
+
+    if args.roll_quantile is not None:
+        # Rolling time-window quantile
+        thr_s = (err_s.rolling(args.roll_window, min_periods=300)
+                        .quantile(args.roll_quantile))
+        thr_vec = thr_s.reindex(err_s.index).to_numpy()
+        print(f"[diag] rolling thr: q={args.roll_quantile} window={args.roll_window}")
+    else:
+        # Keep your current behavior (fixed threshold)
+        thr_vec = np.full_like(err_s.values, fill_value=thr, dtype=float)
+
+    anom = err_s.values > thr_vec
 
     # direction: sign(micro_tilt + alpha*imb) at the last frame
     mt = F["micro_tilt"].values[window:]
@@ -229,7 +262,7 @@ def main():
     spread_bps = (np.array(F["spread"].values[window:], dtype=float) / np.array(F["mid"].values[window:], dtype=float) * 1e4)
     ok_spread = spread_bps <= args.spread_cap_bps
 
-    sig = np.where(err > thr, dir_sig, 0)
+    sig = np.where(anom, dir_sig, 0)
 
     # require N consecutive anomalies
     if args.consec > 1:
@@ -289,35 +322,73 @@ def main():
         # convert to predicted edge in bps at the prior bar (causal)
         atr_prev = F["atr_mid"].loc[idx_r].shift(1).reindex(idx_r).values
         mid_prev = F["mid"].loc[idx_r].shift(1).reindex(idx_r).values
-        edge_bps = y_hat * atr_prev * 1e4
-        finite = np.isfinite(edge_bps)
+        edge_bps_raw = y_hat * atr_prev * 1e4
+        edge_bps     = args.edge_scale * edge_bps_raw
+
+        # 2) Print both raw and scaled stats so you can calibrate easily
+        finite = np.isfinite(edge_bps_raw)
         print(
-            f"[diag] edge_bps abs p50={np.nanmedian(np.abs(edge_bps)):.3f}, "
-            f"p90={np.nanquantile(np.abs(edge_bps[finite]), 0.90):.3f}, "
-            f"p99={np.nanquantile(np.abs(edge_bps[finite]), 0.99):.3f}"
+            f"[diag] edge_bps RAW abs p50={np.nanmedian(np.abs(edge_bps_raw)):.3f}, "
+            f"p90={np.nanquantile(np.abs(edge_bps_raw[finite]), 0.90):.3f}, "
+            f"p99={np.nanquantile(np.abs(edge_bps_raw[finite]), 0.99):.3f}"
+        )
+        finite2 = np.isfinite(edge_bps)
+        print(
+            f"[diag] edge_bps SCALED(x{args.edge_scale:g}) abs p50={np.nanmedian(np.abs(edge_bps)):.3f}, "
+            f"p90={np.nanquantile(np.abs(edge_bps[finite2]), 0.90):.3f}, "
+            f"p99={np.nanquantile(np.abs(edge_bps[finite2]), 0.99):.3f}"
         )
 
+        # 3) Build the series from the *scaled* edges (unchanged if you use the new 'edge_bps')
         edge_ser = (pd.Series(edge_bps, index=idx_r)
                     .reindex(idx)
-                    .where(lambda s: np.isfinite(s), 0.0)  # non-finite -> 0
+                    .where(lambda s: np.isfinite(s), 0.0)
                     .values)
 
         costs_bps = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps
 
         # require direction consistency and edge > costs+buffer, but only where finite
         finite_gate = np.isfinite(edge_ser)
+        # === build a per-bar min edge in bps ===
+        # Base round-trip costs + your existing edge buffer:
+        base_costs_bps = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps
+
+        # Make sure we have spread in F (raw, not bps); if not, compute quickly:
+        if "spread" not in F.columns:
+            F["spread"] = F["ask_px"] - F["bid_px"]
+
+        # spread (bps) aligned to idx:
+        spread_bps_vec = (F["spread"].reindex(idx).values /
+                        np.maximum(F["mid"].reindex(idx).values, 1e-12)) * 1e4
+
+        if args.auto_min_edge:
+            # dynamic: costs + k_spread * spread_bps
+            min_edge_vec = base_costs_bps + args.k_spread * spread_bps_vec
+            print(f"[diag] dynamic min_edge: base={base_costs_bps:.2f} + {args.k_spread}*spread_bps")
+        else:
+            # legacy: scalar min-edge on top of costs
+            min_edge_vec = base_costs_bps + args.min_edge_bps
+
+        if args.auto_min_edge:
+            me = pd.Series(min_edge_vec, index=idx)
+            print("[diag] dynamic min_edge bps: "
+                f"med={np.nanmedian(me):.2f}, p90={np.nanquantile(me,0.90):.2f}, "
+                f"p99={np.nanquantile(me,0.99):.2f}")
+            print(f"[diag] pass |edge|>=min_edge: {int(np.nansum(np.abs(edge_ser) >= min_edge_vec))}")
+        else:
+            print(f"[diag] static min_edge_bps: base={base_costs_bps:.2f}+{args.min_edge_bps:.2f}; "
+                f"pass: {int(np.nansum(np.abs(edge_ser) >= (base_costs_bps + args.min_edge_bps)))}")
+
+        # === finite-aware masks (keep your existing direction check) ===
+        finite_gate = np.isfinite(edge_ser)
         dir_ok = np.zeros_like(sig, dtype=bool)
         dir_ok[finite_gate] = np.sign(edge_ser[finite_gate]) == sig[finite_gate]
 
         mag_ok = np.zeros_like(sig, dtype=bool)
-        mag_ok[finite_gate] = np.abs(edge_ser[finite_gate]) >= (costs_bps + args.min_edge_bps)
+        # use per-bar threshold (vector); broadcast works since both are 1-D
+        mag_ok[finite_gate] = np.abs(edge_ser[finite_gate]) >= min_edge_vec[finite_gate]
 
-        sig = np.where((sig != 0) & dir_ok & mag_ok, sig, 0)
-
-        # require direction consistency and edge > costs+buffer
-        costs_bps = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps
-        dir_ok  = np.sign(np.asarray(edge_ser)) == np.asarray(sig)
-        mag_ok  = np.abs(np.asarray(edge_ser)) >= (costs_bps + args.min_edge_bps)
+        # Final regressor gate:
         sig = np.where((sig != 0) & dir_ok & mag_ok, sig, 0)
 
     if args.max_trades_per_hour:
