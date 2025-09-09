@@ -51,3 +51,19 @@ Bypass the edge gate
   --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 `
   --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
   --roll-quantile 0.9 --roll-window 2h --consec 2 --spread-cap-bps 1.5 --plot
+
+LightGBM Training
+--------------------
+# Example: LightGBM on OKX top-of-book, 5-s snapshot sampling
+python train_orderbook.py --algo lgbm --symbol ETH-USDT --step 5 --target mid_delta_norm --plot
+
+LightGBM BackTest 
+--------------------
+python ob_lgbm_backtest.py `
+  --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --timeout 600 `
+  --auto-min-edge --k-spread 0.3 --spread-cap-bps 2.5 `
+  --edge-scale 1.0 --hold 2 --position-frac 0.1 --fee-bps 2 --slip-bps 1 `
+  --max-trades-per-hour 10 --plot
+
