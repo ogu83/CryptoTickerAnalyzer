@@ -9,6 +9,12 @@ import matplotlib.pyplot as plt
 import joblib
 from sklearn.preprocessing import MinMaxScaler
 import psycopg
+# add with other imports
+try:
+    import lightgbm as lgb
+except ImportError as e:
+    raise SystemExit("Missing dependency: pip install lightgbm") from e
+
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 from tensorflow import keras
@@ -28,7 +34,7 @@ def fetch_ob(api, symbol, start=None, end=None, step=1) -> pd.DataFrame:
     if start: p["start"] = start
     if end:   p["end"] = end
     url = f"{api.rstrip('/')}/ob-top"
-    r = requests.get(url, params=p, timeout=120); r.raise_for_status()
+    r = requests.get(url, params=p, timeout=600); r.raise_for_status()
     js = r.json()
     if not js:
         raise SystemExit("No order book rows returned.")
@@ -123,9 +129,15 @@ def main():
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--target", choices=["mid", "mid_delta", "mid_delta_norm"], default="mid_delta_norm")
     ap.add_argument("--plot", action="store_true")
+
     # save package (like your multi-venue trainer)
     ap.add_argument("--save-dir", default="models_ob")
     ap.add_argument("--model-name", default=None)
+
+    # model choice
+    ap.add_argument("--algo", choices=["lgbm", "lstm"], default="lgbm",
+                help="Choose LightGBM (tabular) or the existing LSTM sequence model")
+
     args = ap.parse_args()
 
     print(f"Fetching OB top for {args.symbol} …")
@@ -159,104 +171,253 @@ def main():
     Xte_s = fs.transform(Xte.reshape(-1, X.shape[-1])).reshape(Xte.shape)
     Ytr_s = ys.fit_transform(Ytr)
 
-    model = build_model(window=args.window, n_features=X.shape[-1])
-    cb = [
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5, verbose=1),
-        keras.callbacks.EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True)
-    ]
-    model.fit(Xtr_s, Ytr_s, validation_split=0.15, epochs=args.epochs, batch_size=256, verbose=1, callbacks=cb)
+    # --- LightGBM (tabular) path -----------------------------------------------
+    if args.algo == "lgbm":
+        # Build the supervised table: features at t, label for t->t+1
+        # Reuse your feature builder outputs (includes lags & ATR-like already).
+        mid = feats["mid"]
+        if args.target == "mid":
+            y_series = mid.shift(-1)
+            def recon(prev_mid, yhat, prev_atr): return yhat
+        elif args.target == "mid_delta":
+            y_series = mid.shift(-1) - mid
+            def recon(prev_mid, yhat, prev_atr): return prev_mid + yhat
+        else:  # mid_delta_norm
+            # IMPORTANT: normalize by ATR at t-1 so it's causal
+            y_series = (mid.shift(-1) - mid) / (feats["atr_mid"].shift(1) + 1e-8)
+            def recon(prev_mid, yhat, prev_atr): return prev_mid + yhat * (prev_atr + 1e-8)
 
-    Yhat_s = model.predict(Xte_s, verbose=0)
-    y_pred = ys.inverse_transform(Yhat_s).flatten()
-    y_true = Yte.flatten()
+        # Assemble dataset (drop rows where any feature/label is NaN)
+        Z = pd.concat([feats, y_series.rename("y")], axis=1).dropna()
+        feature_cols = [c for c in Z.columns if c not in ["y"]]  # keep 'mid' for reconstruction later
 
-    # --- Reconstruct to PRICE space (robust) ---
-    prev_mid = mid.reindex(idx_te).shift(1).ffill().bfill().to_numpy()
-    prev_atr = feats["atr_mid"].reindex(idx_te).shift(1).ffill().bfill().to_numpy()
+        # Chronological split 80/20
+        n = len(Z)
+        n_tr = int(n * 0.8)
+        train_df = Z.iloc[:n_tr]
+        test_df  = Z.iloc[n_tr:]
 
-    y_pred_price = recon(prev_mid, y_pred, prev_atr)
-    y_true_price = recon(prev_mid, y_true, prev_atr)
+        X_tr = train_df[feature_cols].values
+        y_tr = train_df["y"].values
+        X_te = test_df[feature_cols].values
+        y_te = test_df["y"].values
+        idx_te = test_df.index
 
-    # Drop any remaining non-finite values before computing metrics
-    mask = np.isfinite(y_pred_price) & np.isfinite(y_true_price)
-    y_pred_price = y_pred_price[mask]
-    y_true_price = y_true_price[mask]
+        # Model
+        model = lgb.LGBMRegressor(
+            objective="regression",
+            n_estimators=4000,
+            learning_rate=0.03,
+            num_leaves=127,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=1e-2,
+            reg_lambda=1e-2,
+            random_state=42,
+        )
 
-    m = evaluate(y_true_price, y_pred_price)
-    print("\n=== Test Metrics (mid in price space) ===")
-    for k,v in m.items():
-        print(f"{k:>10}: {v:,.6f}")
+        # Early stopping using last part of training as eval (time-safe)
+        es_val_frac = 0.1
+        n_es = int(len(X_tr) * (1 - es_val_frac))
+        X_fit, X_val = X_tr[:n_es], X_tr[n_es:]
+        y_fit, y_val = y_tr[:n_es], y_tr[n_es:]
 
-    if args.plot:
+        model.fit(
+            X_fit, y_fit,
+            eval_set=[(X_val, y_val)],
+            eval_metric="l2",
+            callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(100)]
+        )
+
+        # Predict label-space, then reconstruct to PRICE space
+        y_pred = model.predict(X_te, num_iteration=model.best_iteration_)
+        prev_mid = test_df["mid"].shift(0).to_numpy()        # mid at time t
+        prev_atr = Z["atr_mid"].shift(1).reindex(idx_te).to_numpy()  # ATR at t-1 (matches y construction)
+
+        y_pred_price = recon(prev_mid, y_pred, prev_atr)
+        y_true_price = recon(prev_mid, y_te,   prev_atr)
+
+        mask = np.isfinite(y_pred_price) & np.isfinite(y_true_price)
+        y_pred_price = y_pred_price[mask]
+        y_true_price = y_true_price[mask]
+        idx_plot = idx_te[mask]
+
+        # Metrics (your helper is fine too)
+        mae  = float(np.mean(np.abs(y_true_price - y_pred_price)))
+        rmse = float(np.sqrt(np.mean((y_true_price - y_pred_price)**2)))
+        mape = float(np.mean(np.abs((y_true_price - y_pred_price) / np.maximum(1e-8, np.abs(y_true_price)))) * 100.0)
+
+        print("\n=== LightGBM • Test Metrics (mid in price space) ===")
+        print(f"{'MAE':>10}: {mae:,.6f}")
+        print(f"{'RMSE':>10}: {rmse:,.6f}")
+        print(f"{'MAPE%':>10}: {mape:,.6f}")
+
+        # Plot
         plt.figure(figsize=(12,4))
-        plt.plot(idx_te[mask], y_true_price, label="Actual")
-        plt.plot(idx_te[mask], y_pred_price, label="Predicted", alpha=0.8)
-        plt.title(f"OKX {args.symbol} • next mid forecast (target={args.target})")
+        plt.plot(idx_plot, y_true_price, label="Actual")
+        plt.plot(idx_plot, y_pred_price, label="Predicted", alpha=0.85)
+        plt.title(f"OKX {args.symbol} • step={args.step} • LightGBM • target={args.target}")
         plt.xlabel("Time"); plt.ylabel("Mid"); plt.legend(); plt.tight_layout()
         plt.savefig("ob_pred_vs_actual.png")
         print("Saved plot: ob_pred_vs_actual.png")
 
-    # -------- save package (same pattern as multi-venue) --------
-    run_id = f"okx_ob_{args.symbol}_step{args.step}_{args.target}_w{args.window}"
-    model_name = args.model_name or run_id
-    out_dir = Path(args.save_dir) / model_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+        # Save package (parallel to your Keras saver)
+        run_id = f"okx_ob_{args.symbol}_step{args.step}_{args.target}_lgbm"
+        model_name = args.model_name or run_id
+        out_dir = Path(args.save_dir) / model_name
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    model_path = out_dir / "model.keras"
-    model.save(model_path.as_posix())
-    print(f"[model] saved to {model_path}")
+        joblib.dump(model, out_dir / "model_lgbm.pkl")
+        with open(out_dir / "features.json", "w") as f:
+            json.dump(feature_cols, f, indent=2)
+        with open(out_dir / "config.json", "w") as f:
+            json.dump({
+                "algo": "lgbm",
+                "symbol": args.symbol,
+                "target": args.target,
+                "step": args.step,
+                "start": args.start,
+                "end": args.end
+            }, f, indent=2)
+        print(f"[model] saved to {out_dir/'model_lgbm.pkl'}")
 
-    joblib.dump(fs, out_dir / "feature_scaler.pkl")
-    joblib.dump(ys, out_dir / "target_scaler.pkl")
+        # Optional: register to Postgres (reuse your existing registry code)
+        try:
+            dsn = f"host={PG_HOST} port={PG_PORT} user={PG_USER} password={PG_PASSWORD} dbname={PG_DBNAME}"
+            with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+                cur.execute("""
+                    create table if not exists ml_model_registry (
+                        id bigserial primary key,
+                        created_at timestamptz default now(),
+                        model_name text unique,
+                        path text,
+                        params jsonb,
+                        metrics jsonb
+                    );
+                """)
+                cur.execute("""
+                    insert into ml_model_registry (model_name, path, params, metrics)
+                    values (%s, %s, %s::jsonb, %s::jsonb)
+                    on conflict (model_name) do update set
+                        path = EXCLUDED.path,
+                        params = EXCLUDED.params,
+                        metrics = EXCLUDED.metrics
+                """, (
+                    model_name,
+                    str(out_dir),
+                    json.dumps({
+                        "algo": "lgbm",
+                        "symbol": args.symbol, "target": args.target,
+                        "step": args.step, "start": args.start, "end": args.end
+                    }, allow_nan=False),
+                    json.dumps({"MAE": mae, "RMSE": rmse, "MAPE%": mape}, allow_nan=False)
+                ))
+                conn.commit()
+            print(f"[db] model registered as '{model_name}'")
+        except Exception as e:
+            print(f"[db] registry skipped: {e}")
 
-    with open(out_dir / "features.json", "w") as f:
-        json.dump(cols, f, indent=2)
+        return  # prevent falling into the LSTM branch
+        # --- end LightGBM path ------------------------------------------------------
+    else:
+        model = build_model(window=args.window, n_features=X.shape[-1])
+        cb = [
+            keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5, verbose=1),
+            keras.callbacks.EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True)
+        ]
+        model.fit(Xtr_s, Ytr_s, validation_split=0.15, epochs=args.epochs, batch_size=256, verbose=1, callbacks=cb)
 
-    with open(out_dir / "config.json", "w") as f:
-        json.dump({
-            "symbol": args.symbol,
-            "target": args.target,
-            "window": args.window,
-            "step": args.step,
-            "start": args.start,
-            "end": args.end
-        }, f, indent=2)
+        Yhat_s = model.predict(Xte_s, verbose=0)
+        y_pred = ys.inverse_transform(Yhat_s).flatten()
+        y_true = Yte.flatten()
 
-    # optional: register in Postgres
-    try:
-        dsn = f"host={PG_HOST} port={PG_PORT} user={PG_USER} password={PG_PASSWORD} dbname={PG_DBNAME}"
-        with psycopg.connect(dsn) as conn, conn.cursor() as cur:
-            cur.execute("""
-                create table if not exists ml_model_registry (
-                    id bigserial primary key,
-                    created_at timestamptz default now(),
-                    model_name text unique,
-                    path text,
-                    params jsonb,
-                    metrics jsonb
-                );
-            """)
-            cur.execute("""
-                insert into ml_model_registry (model_name, path, params, metrics)
-                values (%s, %s, %s::jsonb, %s::jsonb)
-                on conflict (model_name) do update set
-                    path = EXCLUDED.path,
-                    params = EXCLUDED.params,
-                    metrics = EXCLUDED.metrics
-            """, (
-                model_name,
-                str(out_dir),
-                json.dumps({
-                    "symbol": args.symbol, "target": args.target,
-                    "window": args.window, "step": args.step,
-                    "start": args.start, "end": args.end
-                }, allow_nan=False),
-                json.dumps(m, allow_nan=False)
-            ))
-            conn.commit()
-        print(f"[db] model registered as '{model_name}'")
-    except Exception as e:
-        print(f"[db] registry skipped: {e}")
+        # --- Reconstruct to PRICE space (robust) ---
+        prev_mid = mid.reindex(idx_te).shift(1).ffill().bfill().to_numpy()
+        prev_atr = feats["atr_mid"].reindex(idx_te).shift(1).ffill().bfill().to_numpy()
+
+        y_pred_price = recon(prev_mid, y_pred, prev_atr)
+        y_true_price = recon(prev_mid, y_true, prev_atr)
+
+        # Drop any remaining non-finite values before computing metrics
+        mask = np.isfinite(y_pred_price) & np.isfinite(y_true_price)
+        y_pred_price = y_pred_price[mask]
+        y_true_price = y_true_price[mask]
+
+        m = evaluate(y_true_price, y_pred_price)
+        print("\n=== Test Metrics (mid in price space) ===")
+        for k,v in m.items():
+            print(f"{k:>10}: {v:,.6f}")
+
+        if args.plot:
+            plt.figure(figsize=(12,4))
+            plt.plot(idx_te[mask], y_true_price, label="Actual")
+            plt.plot(idx_te[mask], y_pred_price, label="Predicted", alpha=0.8)
+            plt.title(f"OKX {args.symbol} • next mid forecast (target={args.target})")
+            plt.xlabel("Time"); plt.ylabel("Mid"); plt.legend(); plt.tight_layout()
+            plt.savefig("ob_pred_vs_actual.png")
+            print("Saved plot: ob_pred_vs_actual.png")
+
+        # -------- save package (same pattern as multi-venue) --------
+        run_id = f"okx_ob_{args.symbol}_step{args.step}_{args.target}_w{args.window}"
+        model_name = args.model_name or run_id
+        out_dir = Path(args.save_dir) / model_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        model_path = out_dir / "model.keras"
+        model.save(model_path.as_posix())
+        print(f"[model] saved to {model_path}")
+
+        joblib.dump(fs, out_dir / "feature_scaler.pkl")
+        joblib.dump(ys, out_dir / "target_scaler.pkl")
+
+        with open(out_dir / "features.json", "w") as f:
+            json.dump(cols, f, indent=2)
+
+        with open(out_dir / "config.json", "w") as f:
+            json.dump({
+                "symbol": args.symbol,
+                "target": args.target,
+                "window": args.window,
+                "step": args.step,
+                "start": args.start,
+                "end": args.end
+            }, f, indent=2)
+
+        # optional: register in Postgres
+        try:
+            dsn = f"host={PG_HOST} port={PG_PORT} user={PG_USER} password={PG_PASSWORD} dbname={PG_DBNAME}"
+            with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+                cur.execute("""
+                    create table if not exists ml_model_registry (
+                        id bigserial primary key,
+                        created_at timestamptz default now(),
+                        model_name text unique,
+                        path text,
+                        params jsonb,
+                        metrics jsonb
+                    );
+                """)
+                cur.execute("""
+                    insert into ml_model_registry (model_name, path, params, metrics)
+                    values (%s, %s, %s::jsonb, %s::jsonb)
+                    on conflict (model_name) do update set
+                        path = EXCLUDED.path,
+                        params = EXCLUDED.params,
+                        metrics = EXCLUDED.metrics
+                """, (
+                    model_name,
+                    str(out_dir),
+                    json.dumps({
+                        "symbol": args.symbol, "target": args.target,
+                        "window": args.window, "step": args.step,
+                        "start": args.start, "end": args.end
+                    }, allow_nan=False),
+                    json.dumps(m, allow_nan=False)
+                ))
+                conn.commit()
+            print(f"[db] model registered as '{model_name}'")
+        except Exception as e:
+            print(f"[db] registry skipped: {e}")
 
 if __name__ == "__main__":
     main()
