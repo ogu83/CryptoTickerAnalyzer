@@ -44,3 +44,10 @@ python ob_anomaly_backtest.py `
   --max-trades-per-hour 5 --hold 2 --position-frac 0.05 `
   --fee-bps 2 --slip-bps 1 `
   --plot
+
+Bypass the edge gate
+--------------------
+  python ob_anomaly_backtest.py `
+  --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --roll-quantile 0.9 --roll-window 2h --consec 2 --spread-cap-bps 1.5 --plot
