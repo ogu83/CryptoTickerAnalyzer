@@ -27,3 +27,20 @@ python ob_anomaly_backtest.py --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_st
 Scale edges to realistic, cost-clearing levels
 --------------------
 python ob_anomaly_backtest.py --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 --reg-model-dir models_ob\okx_ob_ETH-USDT_step5_mid_delta_norm_w64 --api http://macbook-server:8200 --symbol ETH-USDT --step 5 --roll-quantile 0.90 --roll-window 2h --consec 2 --spread-cap-bps 1.5 --fee-bps 0 --slip-bps 0 --edge-buffer-bps 0 --auto-min-edge --k-spread 0 --edge-scale 8.0 --plot
+
+
+A concrete “balanced” recipe
+--------------------
+python ob_anomaly_backtest.py `
+  --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 `
+  --reg-model-dir models_ob\okx_ob_ETH-USDT_step5_mid_delta_norm_w64 `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --roll-quantile 0.85 --roll-window 90min `
+  --consec 2 --spread-cap-bps 1.5 --side-persist 2 `
+  --auto-min-edge --k-spread 0.3 `
+  --edge-buffer-bps 0.5 `
+  --auto-edge-scale 0.90 `
+  --min-pass-rate 0.08 `
+  --max-trades-per-hour 5 --hold 2 --position-frac 0.05 `
+  --fee-bps 2 --slip-bps 1 `
+  --plot
