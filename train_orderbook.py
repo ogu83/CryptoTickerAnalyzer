@@ -7,14 +7,13 @@ import pandas as pd
 import requests
 import matplotlib.pyplot as plt
 import joblib
-from sklearn.preprocessing import MinMaxScaler
 import psycopg
-# add with other imports
-try:
-    import lightgbm as lgb
-except ImportError as e:
-    raise SystemExit("Missing dependency: pip install lightgbm") from e
 
+import lightgbm as lgb
+from lightgbm import LGBMRegressor, LGBMClassifier
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.preprocessing import MinMaxScaler
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 from tensorflow import keras
@@ -27,8 +26,68 @@ PG_USER = "postgres"
 PG_PASSWORD = "Postgres2839*"
 PG_DBNAME = "CryptoTickers"  # target DB name
 
-# ---------------- API fetch ----------------
+# --- helper: choose a good gate threshold on a validation tail ---
+def _pick_gate_threshold(p, realized_bps, min_edge_bps, grid=None):
+    """
+    p:   classifier proba (for class=1)
+    realized_bps: future realized return in bps (signed)
+    min_edge_bps: dynamic hurdle in bps (>= costs)
+    We pick thr maximizing expected net bps (rough, but practical).
+    """
+    if grid is None:
+        grid = np.linspace(0.50, 0.95, 10)
 
+    best_thr, best_score = 0.5, -1e9
+    for thr in grid:
+        mask = (p >= thr)
+        if mask.sum() == 0:
+            continue
+        # crude net bps = directional return minus hurdle
+        net = np.sign(realized_bps[mask]) * np.maximum(np.abs(realized_bps[mask]) - min_edge_bps[mask], 0.0)
+        score = np.nanmean(net)
+        if score > best_score:
+            best_score, best_thr = score, thr
+    return best_thr, best_score
+
+# --- helper: OOF regression preds (walk-forward) ---
+def _oof_reg_preds(X, y, times, n_splits=5, seed=42):
+    """
+    Time-ordered OOF predictions for the regressor.
+    Returns: oof_pred (np.array), final_reg (fitted on full data).
+    """
+    splitter = TimeSeriesSplit(n_splits=n_splits)
+    oof = np.full(len(y), np.nan, dtype=float)
+
+    reg_params = dict(
+        n_estimators=600, learning_rate=0.05,
+        max_depth=-1, num_leaves=64,
+        subsample=0.8, colsample_bytree=0.8,
+        random_state=seed, n_jobs=-1
+    )
+
+    for tr, va in splitter.split(X):
+        reg = LGBMRegressor(**reg_params)
+        reg.fit(
+            X.iloc[tr], y.iloc[tr],
+            eval_set=[(X.iloc[va], y.iloc[va])],
+            eval_metric="l2",
+            callbacks=[lgb.log_evaluation(100)]
+        )
+        oof[va] = reg.predict(X.iloc[va])
+
+    # Fit final reg on full data (optional export)
+    final_reg = LGBMRegressor(**reg_params)
+    final_reg.fit(
+        X, y,
+        eval_set=[(X, y)],
+        eval_metric="l2",
+        callbacks=[lgb.log_evaluation(200)]
+    )
+
+    return oof, final_reg
+
+
+# ---------------- API fetch ----------------
 def fetch_ob(api, symbol, start=None, end=None, step=1) -> pd.DataFrame:
     p = {"symbol": symbol, "step": step}
     if start: p["start"] = start
@@ -108,8 +167,100 @@ def build_model(window, n_features):
     m.compile(optimizer=keras.optimizers.Adam(1e-3, clipnorm=1.0), loss=keras.losses.Huber(delta=1.0))
     return m
 
-# ---------------- metrics ----------------
+# --- NEW: training path for a profitability gate ---
+def train_lgbm_gate(F, feat_cols, symbol, step, out_dir, args):
+    """
+    F: feature dataframe you already build (one row per bar/step)
+       must include:
+         - 'time' (index or column), 'mid', 'spread_bps', 'atr14'
+         - target columns from your builder: y_norm (mid_delta_norm) or y in price
+    feat_cols: same columns used for the LGBM regressor
+    """
 
+    # 1) Targets and dynamic hurdle
+    mid = F["mid"].astype(float)
+    spread_bps = F["spread_bps"].astype(float).clip(lower=0)
+    # realized future return (step ahead) in bps
+    ret_bps = ((mid.shift(-step) - mid) / mid * 1e4).astype(float)
+
+    # hurdle ~ fees+slip base + k*spread
+    gate_base = getattr(args, "gate_base_bps", 7.0)
+    k_spread = getattr(args, "k_spread", 0.3)
+    min_edge_bps = gate_base + k_spread * spread_bps
+
+    # 2) OOF regression preds as a feature to the classifier (edge estimate)
+    #    y_reg = normalized delta (what you trained before)
+    if "y_norm" in F.columns:
+        y_reg = F["y_norm"].astype(float)
+        # convert predicted norm back to bps using previous ATR (your feature name is atr_mid)
+        atr_prev = F["atr_mid"].shift(1).astype(float)
+        mid_prev = mid.shift(1)
+        X_reg = F[feat_cols].copy()
+        oof_norm, reg_full = _oof_reg_preds(X_reg, y_reg, F.index, n_splits=getattr(args, "cv", 5), seed=getattr(args, "seed", 42))
+        # make it a Series aligned to F.index, handle div-by-zero / inf safely
+        pred_edge_bps = pd.Series(oof_norm, index=F.index) * (atr_prev / mid_prev) * 1e4
+        pred_edge_bps = pred_edge_bps.replace([np.inf, -np.inf], np.nan).fillna(0.0)    
+    else:
+        # Fallback: if y_norm not present, we’ll rely only on base features (still works, but weaker)
+        pred_edge_bps = pd.Series(0.0, index=F.index)
+
+    F["pred_edge_bps"] = pred_edge_bps
+    F["abs_pred_edge_bps"] = pred_edge_bps.abs()
+    X_cls = F[feat_cols + ["pred_edge_bps", "abs_pred_edge_bps"]].fillna(0.0)
+
+    # 3) Profitability label for the gate (using realized returns & predicted direction)
+    ok_dir = np.sign(pred_edge_bps).replace(0, np.nan) == np.sign(ret_bps).replace(0, np.nan)
+    big_enough = (ret_bps.abs() >= min_edge_bps)
+    y_gate = (ok_dir & big_enough).astype(int)
+
+    # 4) Time split: train on head, pick threshold on tail
+    split = int(len(F) * 0.8)
+    X_tr, X_va = X_cls.iloc[:split], X_cls.iloc[split:]
+    y_tr, y_va = y_gate.iloc[:split], y_gate.iloc[split:]
+    ret_va, hurdle_va = ret_bps.iloc[split:], min_edge_bps.iloc[split:]
+
+    cls = LGBMClassifier(
+        n_estimators=400, learning_rate=0.05,
+        num_leaves=64, max_depth=-1,
+        subsample=0.8, colsample_bytree=0.8,
+        reg_alpha=0.0, reg_lambda=0.0,
+        class_weight="balanced",
+        random_state=getattr(args, "seed", 42),
+        n_jobs=-1
+    )
+    cls.fit(
+        X_tr, y_tr,
+        eval_set=[(X_va, y_va)],
+        eval_metric="binary_logloss",
+        callbacks=[lgb.log_evaluation(100)]
+    )
+
+    # 5) Pick a probability threshold that maximizes expected bps on the validation tail
+    p_va = pd.Series(cls.predict_proba(X_va)[:, 1], index=X_va.index)
+    thr_star, score_star = _pick_gate_threshold(p_va.values, ret_va.values, hurdle_va.values)
+
+    # 6) Persist: model + metadata; keep your PNG too if desired
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(cls, out_dir / "gate_lgbm.pkl")
+
+    meta = dict(
+        symbol=symbol, step=step, algo="lgbm_gate",
+        feat_cols=feat_cols + ["pred_edge_bps", "abs_pred_edge_bps"],
+        gate_base_bps=float(gate_base), k_spread=float(k_spread),
+        thr_star=float(thr_star)
+    )
+    with (out_dir / "gate_meta.json").open("w") as f:
+        json.dump(meta, f, indent=2)
+
+    # quick report to console
+    ap = average_precision_score(y_va, p_va)
+    auc = roc_auc_score(y_va, p_va)
+    print(f"[gate] AUC={auc:.3f}  AP={ap:.3f}  thr*={thr_star:.3f} (val net-bps≈{score_star:.3f})")
+    print(f"[model] gate saved to {out_dir.as_posix()}")
+
+
+# ---------------- metrics ----------------
 def evaluate(y_true_price, y_pred_price):
     mae  = float(np.mean(np.abs(y_true_price - y_pred_price)))
     rmse = float(np.sqrt(np.mean((y_true_price - y_pred_price)**2)))
@@ -117,7 +268,6 @@ def evaluate(y_true_price, y_pred_price):
     return {"MAE": mae, "RMSE": rmse, "MAPE%": mape}
 
 # ---------------- main ----------------
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", default="http://macbook-server:8200")
@@ -135,8 +285,10 @@ def main():
     ap.add_argument("--model-name", default=None)
 
     # model choice
-    ap.add_argument("--algo", choices=["lgbm", "lstm"], default="lgbm",
-                help="Choose LightGBM (tabular) or the existing LSTM sequence model")
+    ap.add_argument("--algo", choices=["keras", "lgbm", "lgbm_gate"], default="lgbm")
+    ap.add_argument("--cv", type=int, default=5)
+    ap.add_argument("--gate-base-bps", dest="gate_base_bps", type=float, default=7.0)
+    ap.add_argument("--k-spread", type=float, default=0.3)
 
     args = ap.parse_args()
 
@@ -170,6 +322,13 @@ def main():
     Xtr_s = fs.fit_transform(Xtr.reshape(-1, X.shape[-1])).reshape(Xtr.shape)
     Xte_s = fs.transform(Xte.reshape(-1, X.shape[-1])).reshape(Xte.shape)
     Ytr_s = ys.fit_transform(Ytr)
+
+    if args.algo == "lgbm_gate":
+        # out dir name mirrors your convention
+        out_dir = f"models_ob/okx_ob_{args.symbol}_step{args.step}_gate_lgbm"
+        feat_cols = [c for c in feats.columns if c not in ["mid"]]  # exclude 'mid' if needed
+        train_lgbm_gate(feats, feat_cols, args.symbol, args.step, out_dir, args)
+        return
 
     # --- LightGBM (tabular) path -----------------------------------------------
     if args.algo == "lgbm":

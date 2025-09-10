@@ -153,8 +153,23 @@ def main():
                     help="Per-bar min edge = (2*fee+2*slip+buffer) + k_spread * spread_bps.")
     ap.add_argument("--k-spread", type=float, default=0.3)
 
+    ap.add_argument("--gate-model-dir", type=str, default=None,
+                    help="Path to lgbm gate dir (with gate_lgbm.pkl & gate_meta.json)")
+    ap.add_argument("--gate-thr", type=float, default=None,
+                    help="Optional manual gate threshold; if omitted, use thr_star from gate_meta.json")
+
     ap.add_argument("--plot", action="store_true")
     args = ap.parse_args()
+
+    gate_model = None
+    gate_meta = None
+    if args.gate_model_dir:
+        gate_model = joblib.load(Path(args.gate_model_dir) / "gate_lgbm.pkl")
+        with (Path(args.gate_model_dir) / "gate_meta.json").open() as f:
+            gate_meta = json.load(f)
+        if args.gate_thr is None:
+            args.gate_thr = float(gate_meta.get("thr_star", 0.6))
+        print(f"[gate] loaded • thr={args.gate_thr:.3f}")
 
     # load model + metadata
     mdir = Path(args.model_dir)
@@ -180,6 +195,30 @@ def main():
     # trade ONLY from the next bar forward (avoid any look-ahead)
     times = Fx.index[1:]  # we enter at next bar open
     edge_vec = edge_bps.reindex(times)  # already aligned, since we drop the first bar for trading
+
+    # ---------------- optional classifier gate ----------------
+    # If a gate model/threshold is provided, compute p(“profitable”) on the same rows we may trade.
+    if gate_model is not None:
+        # The gate was trained with base features + ["pred_edge_bps","abs_pred_edge_bps"]
+        gate_cols = gate_meta.get("feat_cols", [])
+        # Build those two columns from the live LGBM edge:
+        F_gate = F.copy()
+        F_gate["pred_edge_bps"] = edge_bps
+        F_gate["abs_pred_edge_bps"] = edge_bps.abs()
+
+        # Make sure all columns exist (defensively replace missing with 0s)
+        missing_gate = [c for c in gate_cols if c not in F_gate.columns]
+        if missing_gate:
+            print(f"[gate] WARNING: missing gate features {missing_gate}; filling with 0s")
+            for c in missing_gate:
+                F_gate[c] = 0.0
+
+        X_gate = F_gate.reindex(times)[gate_cols].fillna(0.0)
+        p_gate = gate_model.predict_proba(X_gate)[:, 1]
+        p_gate_ok = p_gate >= float(args.gate_thr)
+        print(f"[gate] applied • thr={args.gate_thr:.3f} • pass_rate={(p_gate_ok.mean()*100):.2f}%")
+    else:
+        p_gate_ok = np.ones(len(times), dtype=bool)
 
     # costs + dynamic min edge
     base_costs = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps

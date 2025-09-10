@@ -67,3 +67,49 @@ python ob_lgbm_backtest.py `
   --edge-scale 1.0 --hold 2 --position-frac 0.1 --fee-bps 2 --slip-bps 1 `
   --max-trades-per-hour 10 --plot
 
+Quick Experiment try not to loose:
+-------------------
+# 1) Calibrated edges + dynamic min-edge + tight spreads, short holds
+python ob_lgbm_backtest.py `
+  --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --auto-min-edge --k-spread 0.3 --edge-buffer-bps 1.0 --spread-cap-bps 1.5 `
+  --hold 1 --position-frac 0.05 --max-trades-per-hour 5 --plot
+
+# 2) Same but rank harder (fewer, better trades)
+python ob_lgbm_backtest.py `
+  --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --auto-min-edge --k-spread 0.3 --edge-buffer-bps 1.0 --spread-cap-bps 1.2 `
+  --hold 1 --position-frac 0.05 --max-trades-per-hour 3 --plot
+
+# 3) Slightly more aggressive after calibration
+python ob_lgbm_backtest.py `
+  --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --auto-min-edge --k-spread 0.3 --edge-buffer-bps 1.0 --spread-cap-bps 1.2 `
+  --hold 2 --position-frac 0.07 --max-trades-per-hour 5 --plot
+
+
+  TRAIN THE gate
+  -------------------------------
+  python train_orderbook.py --algo lgbm_gate --symbol ETH-USDT --step 5 `
+  --gate-base-bps 7.0 --k-spread 0.3 --cv 5
+
+  WIN gate
+  -------------------------------
+  python ob_lgbm_backtest.py `
+  --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm `
+  --gate-model-dir models_ob/okx_ob_ETH-USDT_step5_gate_lgbm `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --auto-min-edge --k-spread 0.3 --spread-cap-bps 1.5 `
+  --edge-scale 1.0 --hold 1 --position-frac 0.05 `
+  --max-trades-per-hour 5 --plot
+
+  python ob_lgbm_backtest.py `
+  --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm `
+  --gate-model-dir models_ob/okx_ob_ETH-USDT_step5_gate_lgbm `
+  --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
+  --auto-min-edge --k-spread 0.3 --spread-cap-bps 1.5 `
+  --edge-scale 1.0 --hold 1 --position-frac 0.05 --gate-thr 0.70 `
+  --max-trades-per-hour 5 --plot
