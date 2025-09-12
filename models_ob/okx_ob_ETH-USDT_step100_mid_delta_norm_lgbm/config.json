@@ -1,0 +1,8 @@
+{
+  "algo": "lgbm",
+  "symbol": "ETH-USDT",
+  "target": "mid_delta_norm",
+  "step": 100,
+  "start": null,
+  "end": null
+}
