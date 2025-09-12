@@ -18,16 +18,13 @@ python ob_anomaly_backtest.py --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_st
 python ob_anomaly_backtest.py --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 --reg-model-dir models_ob\okx_ob_ETH-USDT_step5_mid_delta_norm_w64 --api http://macbook-server:8200 --symbol ETH-USDT --step 5 --roll-quantile 0.90 --roll-window 2h --consec 3 --cooldown 15 --dir-alpha 0.5 --tilt-ema 5 --hold 1 --position-frac 0.05 --fee-bps 2 --slip-bps 1 --spread-cap-bps 1.2 --auto-min-edge --edge-buffer-bps 2 --k-spread 0.5 --edge-scale 5 --max-trades-per-hour 5 --plot
 python ob_anomaly_backtest.py --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 --reg-model-dir models_ob\okx_ob_ETH-USDT_step5_mid_delta_norm_w64 --api http://macbook-server:8200 --symbol ETH-USDT --step 5 --roll-quantile 0.90 --roll-window 2h --consec 3 --side-persist 2 --spread-cap-bps 1.2 --edge-scale 2.5 --auto-min-edge --k-spread 0.6 --edge-buffer-bps 1.5 --edge-margin-bps 0.5 --hold 1 --position-frac 0.05 --max-trades-per-hour 5 --plot
 
-
 SANITY CHECK
 --------------------
 python ob_anomaly_backtest.py --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 --reg-model-dir models_ob\okx_ob_ETH-USDT_step5_mid_delta_norm_w64 --api http://macbook-server:8200 --symbol ETH-USDT --step 5 --roll-quantile 0.90 --roll-window 2h --consec 2 --spread-cap-bps 1.5 --fee-bps 0 --slip-bps 0 --edge-buffer-bps 0 --auto-min-edge --k-spread 0 --edge-scale 1.0 --plot
 
-
 Scale edges to realistic, cost-clearing levels
 --------------------
 python ob_anomaly_backtest.py --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 --reg-model-dir models_ob\okx_ob_ETH-USDT_step5_mid_delta_norm_w64 --api http://macbook-server:8200 --symbol ETH-USDT --step 5 --roll-quantile 0.90 --roll-window 2h --consec 2 --spread-cap-bps 1.5 --fee-bps 0 --slip-bps 0 --edge-buffer-bps 0 --auto-min-edge --k-spread 0 --edge-scale 8.0 --plot
-
 
 A concrete “balanced” recipe
 --------------------
@@ -47,7 +44,7 @@ python ob_anomaly_backtest.py `
 
 Bypass the edge gate
 --------------------
-  python ob_anomaly_backtest.py `
+python ob_anomaly_backtest.py `
   --model-dir models_ob_anom\okx_ob_anom_ETH-USDT_step5_w64 `
   --api http://macbook-server:8200 --symbol ETH-USDT --step 5 `
   --roll-quantile 0.9 --roll-window 2h --consec 2 --spread-cap-bps 1.5 --plot
@@ -90,14 +87,12 @@ python ob_lgbm_backtest.py `
   --auto-min-edge --k-spread 0.3 --edge-buffer-bps 1.0 --spread-cap-bps 1.2 `
   --hold 2 --position-frac 0.07 --max-trades-per-hour 5 --plot
 
+TRAIN THE gate
+-------------------------------
+  python train_orderbook.py --algo lgbm_gate --symbol ETH-USDT --step 5 --gate-base-bps 7.0 --k-spread 0.3 --cv 5
 
-  TRAIN THE gate
-  -------------------------------
-  python train_orderbook.py --algo lgbm_gate --symbol ETH-USDT --step 5 `
-  --gate-base-bps 7.0 --k-spread 0.3 --cv 5
-
-  WIN gate
-  -------------------------------
+WIN gate
+-------------------------------
   python ob_lgbm_backtest.py `
   --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm `
   --gate-model-dir models_ob/okx_ob_ETH-USDT_step5_gate_lgbm `
@@ -113,7 +108,6 @@ python ob_lgbm_backtest.py `
   --auto-min-edge --k-spread 0.3 --spread-cap-bps 1.5 `
   --edge-scale 1.0 --hold 1 --position-frac 0.05 --gate-thr 0.70 `
   --max-trades-per-hour 5 --plot
-
 
 With the saved gate default threshold:
 -------------------------------
