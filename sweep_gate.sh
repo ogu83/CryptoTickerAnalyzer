@@ -8,7 +8,7 @@ SYMBOL="ETH-USDT"
 STEP=5
 
 # thresholds to sweep
-thresholds=(0.55 0.60 0.65 0.70 0.75 0.80)
+thresholds=(0.70 0.75 0.80)
 
 for thr in "${thresholds[@]}"; do
   echo "=== Running sweep for gate-thr=${thr} ==="

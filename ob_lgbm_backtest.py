@@ -11,7 +11,7 @@ import requests, joblib
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 # ---------- fetching & feature engineering (mirrors train_orderbook.py) ----------
-def fetch_ob(api, symbol, start=None, end=None, step=5, timeout=600) -> pd.DataFrame:
+def fetch_ob(api, symbol, start=None, end=None, step=5, timeout=4800) -> pd.DataFrame:
     p = {"symbol": symbol, "step": step}
     if start: p["start"] = start
     if end:   p["end"] = end
