@@ -5,7 +5,7 @@ MODEL_DIR="models_ob/okx_ob_ETH-USDT_step100_mid_delta_norm_lgbm"
 GATE_DIR="models_ob/okx_ob_ETH-USDT_step100_gate_lgbm"
 API="http://macbook-server:8200"
 SYMBOL="ETH-USDT"
-STEP=5
+STEP=100
 TIMEOUT=2400
 
 # thresholds to sweep
