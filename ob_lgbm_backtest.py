@@ -28,6 +28,34 @@ def fetch_ob(api, symbol, start=None, end=None, step=5, timeout=4800) -> pd.Data
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna()
 
+def fetch_ob_chunked(api, symbol, start, end, step=5, timeout=900, chunk_hours=12):
+    """
+    Fetch OB in smaller chunks and concat. Works with your existing /ob-top.
+    """
+    if not start or not end:
+        # fallback to single shot when range isn't specified
+        return fetch_ob(api, symbol, start, end, step=step, timeout=timeout)
+
+    t0 = pd.Timestamp(start).tz_convert("UTC") if pd.Timestamp(start).tzinfo else pd.Timestamp(start, tz="UTC")
+    t1 = pd.Timestamp(end).tz_convert("UTC") if pd.Timestamp(end).tzinfo else pd.Timestamp(end, tz="UTC")
+    frames = []
+    cur = t0
+    delta = pd.Timedelta(hours=chunk_hours)
+
+    while cur < t1:
+        chunk_start = cur.isoformat()
+        chunk_end   = min(cur + delta, t1).isoformat()
+        print(f"[chunk] {chunk_start} -> {chunk_end}")
+        df = fetch_ob(api, symbol, start=chunk_start, end=chunk_end, step=step, timeout=timeout)
+        frames.append(df)
+        cur = cur + delta
+
+    if not frames:
+        raise SystemExit("No data returned for the requested interval.")
+    out = pd.concat(frames).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    return out
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     mid = df["mid"]; spread = df["spread"]
@@ -180,7 +208,13 @@ def main():
     feat_cols = json.loads(feat_file.read_text())
 
     print(f"[load] {mdir.name}  symbol={args.symbol} step={args.step}")
-    ob = fetch_ob(args.api, args.symbol, args.start, args.end, step=args.step, timeout=args.timeout)
+    # ob = fetch_ob(args.api, args.symbol, args.start, args.end, step=args.step, timeout=args.timeout)
+    ob = fetch_ob_chunked(
+        args.api, args.symbol,
+        start=args.start, end=args.end,
+        step=args.step, timeout=args.timeout,
+        chunk_hours=12,   # tune to 6/12/24 as you like
+    )
     F = build_features(ob)
 
     # keep only rows where all features exist
