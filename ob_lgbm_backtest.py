@@ -6,11 +6,12 @@ import pandas as pd
 import requests, joblib
 import matplotlib.pyplot as plt
 import psycopg
+import requests, joblib
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 # ---------- fetching & feature engineering (mirrors train_orderbook.py) ----------
-def fetch_ob(api, symbol, start=None, end=None, step=5, timeout=300) -> pd.DataFrame:
+def fetch_ob(api, symbol, start=None, end=None, step=5, timeout=600) -> pd.DataFrame:
     p = {"symbol": symbol, "step": step}
     if start: p["start"] = start
     if end:   p["end"] = end
@@ -196,29 +197,92 @@ def main():
     times = Fx.index[1:]  # we enter at next bar open
     edge_vec = edge_bps.reindex(times)  # already aligned, since we drop the first bar for trading
 
-    # ---------------- optional classifier gate ----------------
-    # If a gate model/threshold is provided, compute p(“profitable”) on the same rows we may trade.
-    if gate_model is not None:
-        # The gate was trained with base features + ["pred_edge_bps","abs_pred_edge_bps"]
-        gate_cols = gate_meta.get("feat_cols", [])
-        # Build those two columns from the live LGBM edge:
-        F_gate = F.copy()
-        F_gate["pred_edge_bps"] = edge_bps
-        F_gate["abs_pred_edge_bps"] = edge_bps.abs()
+    # ---------- Gate: rebuild features identically to training ----------
+    gate_thr = None
+    gate_pass_mask = None
+    if args.gate_model_dir:
+        gate_dir = Path(args.gate_model_dir)
+        gate = joblib.load(gate_dir / "gate_lgbm.pkl")
+        with open(gate_dir / "gate_meta.json", "r") as f:
+            gate_meta = json.load(f)
 
-        # Make sure all columns exist (defensively replace missing with 0s)
-        missing_gate = [c for c in gate_cols if c not in F_gate.columns]
-        if missing_gate:
-            print(f"[gate] WARNING: missing gate features {missing_gate}; filling with 0s")
-            for c in missing_gate:
-                F_gate[c] = 0.0
+        # threshold: CLI override > saved meta > default 0.5
+        gate_thr = float(args.gate_thr) if (args.gate_thr is not None) \
+            else float(gate_meta.get("thr_star", 0.5))
+        print(f"[gate] loaded • thr={gate_thr:.3f}")
 
-        X_gate = F_gate.reindex(times)[gate_cols].fillna(0.0)
-        p_gate = gate_model.predict_proba(X_gate)[:, 1]
-        p_gate_ok = p_gate >= float(args.gate_thr)
-        print(f"[gate] applied • thr={args.gate_thr:.3f} • pass_rate={(p_gate_ok.mean()*100):.2f}%")
+        # We must build pred_edge_bps the same way as in train_lgbm_gate()
+        # feats must include: mid, spread_bps, atr_mid (the ATR proxy)
+        mid = F["mid"].astype(float)
+        atr_prev = F["atr_mid"].shift(1).astype(float)
+
+        # Use *the same* regressor feature set as saved with the LGBM reg model
+        reg_feat_cols_path = Path(args.model_dir) / "features.json"
+        with open(reg_feat_cols_path, "r") as f:
+            reg_feat_cols = json.load(f)
+
+        X_reg_all = F[reg_feat_cols].fillna(0.0).to_numpy()
+        # model is the LGBM regressor already loaded earlier
+        reg_pred_norm = model.predict(X_reg_all)
+        # convert normalized delta to bps (causal de-normalization)
+        pred_edge_bps = (reg_pred_norm * (atr_prev / mid) * 1e4)
+        pred_edge_bps = pd.Series(pred_edge_bps, index=F.index).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        # augment gate features exactly like training
+        F["pred_edge_bps"] = pred_edge_bps
+        F["abs_pred_edge_bps"] = pred_edge_bps.abs()
+
+        # Use the exact column order saved in gate_meta
+        gate_cols = gate_meta["feat_cols"]
+        missing = [c for c in gate_cols if c not in F.columns]
+        if missing:
+            print(f"[gate][warn] missing columns in inference: {missing}")
+        X_gate = F.reindex(columns=gate_cols).fillna(0.0).to_numpy()
+
+        gate_p = gate.predict_proba(X_gate)[:, 1]
+        p_series = pd.Series(gate_p, index=F.index)
+        print(
+            "[gate] proba stats:",
+            f"min={p_series.min():.3f}, p50={p_series.quantile(0.5):.3f}, "
+            f"p90={p_series.quantile(0.9):.3f}, max={p_series.max():.3f}"
+        )
+
+        # Gate decides at time t whether to take the trade at t+1.
+        # Our 'times' are those t+1 bars; so get probabilities on the same index
+        gate_pass_mask = (p_series.reindex(times).values >= gate_thr)
+        pass_rate = gate_pass_mask.mean() * 100.0
+        print(f"[gate] applied • thr={gate_thr:.3f} • pass_rate={pass_rate:.2f}%")
     else:
-        p_gate_ok = np.ones(len(times), dtype=bool)
+        gate_pass_mask = np.ones(len(times), dtype=bool)
+
+    # -------------------------------------------------------------
+    # OPTIONAL PROFITABILITY GATE (LightGBM classifier)
+    # Uses the same feature list the gate was trained with.
+    if gate_model is not None and gate_meta is not None:
+        # build the gate feature frame on the same index as F
+        # (the trainer added pred_edge features; do the same here)
+        F["pred_edge_bps"] = edge_bps
+        F["abs_pred_edge_bps"] = edge_bps.abs()
+
+        gate_feat_cols = gate_meta.get("feat_cols", [])
+        missing_gate = [c for c in gate_feat_cols if c not in F.columns]
+        if missing_gate:
+            raise SystemExit(f"[gate] missing gate features in F: {missing_gate}")
+
+        # Gate decides at time t whether to take the trade at t+1.
+        # Our 'times' are those t+1 bars; so get probabilities at index 'times'
+        Xg = F[gate_feat_cols].reindex(times).fillna(0.0)
+        p_take = gate_model.predict_proba(Xg)[:, 1]
+        gate_keep = p_take >= float(args.gate_thr)
+        keep_rate = 100.0 * (gate_keep.sum() / max(1, len(gate_keep)))
+        print(f"[gate] applied • thr={args.gate_thr:.3f} • pass_rate={keep_rate:.2f}%")
+
+        # mask: gate failing -> no trade
+        # we only mask; direction/magnitude checks will run next
+        gate_mask = gate_keep.astype(bool)
+    else:
+        gate_mask = np.ones(len(times), dtype=bool)
+    # -------------------------------------------------------------
 
     # costs + dynamic min edge
     base_costs = 2*args.fee_bps + 2*args.slip_bps + args.edge_buffer_bps
@@ -242,7 +306,8 @@ def main():
 
     # magnitude gate
     mag_ok = np.abs(edge_vec.values) >= min_edge_vec
-    sig = np.where(ok_spread & mag_ok, sig, 0)
+    # sig = np.where(ok_spread & mag_ok, sig, 0)
+    sig = np.where(ok_spread & mag_ok & gate_mask, sig, 0)
 
     # optional: throttle per hour by edge “excess”
     if args.max_trades_per_hour:
