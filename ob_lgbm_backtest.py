@@ -92,12 +92,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------- LGBM signal: from delta_norm -> edge (bps) & direction ----------
 def lgbm_predict_edges(model, F: pd.DataFrame, feat_cols: list[str]) -> pd.Series:
-    # Features are row-wise (no sequence). We predict next Δnorm at t, so align to t+1 when trading.
     X = F[feat_cols].copy()
     yhat_norm = model.predict(X)  # next-step normalized delta
-    # de-normalize into price delta using previous ATR(mid)
     atr_prev = F["atr_mid"].shift(1).reindex(F.index).values
-    edge_bps = yhat_norm * atr_prev * 1e4  # convert to bps
+    mid = F["mid"].reindex(F.index).values
+    edge_bps = yhat_norm * (atr_prev / np.maximum(mid, 1e-12)) * 1e4  # <-- consistent
     return pd.Series(edge_bps, index=F.index)
 
 # ---------- simple position-based simulator (enter next bar, exit after H bars) ----------
@@ -266,12 +265,24 @@ def main():
         F["pred_edge_bps"] = pred_edge_bps
         F["abs_pred_edge_bps"] = pred_edge_bps.abs()
 
+        print("[diag] pred_edge_bps stats:",
+            f"min={pred_edge_bps.min():.3f}, p50={pred_edge_bps.quantile(0.5):.3f}, "
+            f"p90={pred_edge_bps.quantile(0.9):.3f}, max={pred_edge_bps.max():.3f}, "
+            f"nan={int(np.isnan(pred_edge_bps).sum())}")
+
+        print("[diag] edge_vec stats:",
+            f"min={np.nanmin(edge_vec.values):.3f}, p50={np.nanpercentile(edge_vec.values,50):.3f}, "
+            f"p90={np.nanpercentile(edge_vec.values,90):.3f}, max={np.nanmax(edge_vec.values):.3f}")
+
         # Use the exact column order saved in gate_meta
         gate_cols = gate_meta["feat_cols"]
         missing = [c for c in gate_cols if c not in F.columns]
         if missing:
             print(f"[gate][warn] missing columns in inference: {missing}")
         X_gate = F.reindex(columns=gate_cols).fillna(0.0).to_numpy()
+
+        print("[diag] gate_cols present?:", all(c in F.columns for c in gate_cols),
+            "missing:", [c for c in gate_cols if c not in F.columns])
 
         gate_p = gate.predict_proba(X_gate)[:, 1]
         p_series = pd.Series(gate_p, index=F.index)
@@ -289,33 +300,8 @@ def main():
     else:
         gate_pass_mask = np.ones(len(times), dtype=bool)
 
-    # -------------------------------------------------------------
-    # OPTIONAL PROFITABILITY GATE (LightGBM classifier)
-    # Uses the same feature list the gate was trained with.
-    if gate_model is not None and gate_meta is not None:
-        # build the gate feature frame on the same index as F
-        # (the trainer added pred_edge features; do the same here)
-        F["pred_edge_bps"] = edge_bps
-        F["abs_pred_edge_bps"] = edge_bps.abs()
 
-        gate_feat_cols = gate_meta.get("feat_cols", [])
-        missing_gate = [c for c in gate_feat_cols if c not in F.columns]
-        if missing_gate:
-            raise SystemExit(f"[gate] missing gate features in F: {missing_gate}")
-
-        # Gate decides at time t whether to take the trade at t+1.
-        # Our 'times' are those t+1 bars; so get probabilities at index 'times'
-        Xg = F[gate_feat_cols].reindex(times).fillna(0.0)
-        p_take = gate_model.predict_proba(Xg)[:, 1]
-        gate_keep = p_take >= float(args.gate_thr)
-        keep_rate = 100.0 * (gate_keep.sum() / max(1, len(gate_keep)))
-        print(f"[gate] applied • thr={args.gate_thr:.3f} • pass_rate={keep_rate:.2f}%")
-
-        # mask: gate failing -> no trade
-        # we only mask; direction/magnitude checks will run next
-        gate_mask = gate_keep.astype(bool)
-    else:
-        gate_mask = np.ones(len(times), dtype=bool)
+    gate_mask = np.ones(len(times), dtype=bool)
     # -------------------------------------------------------------
 
     # costs + dynamic min edge
