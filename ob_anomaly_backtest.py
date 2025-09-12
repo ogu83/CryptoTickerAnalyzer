@@ -27,6 +27,34 @@ def fetch_ob(api, symbol, start=None, end=None, step=1) -> pd.DataFrame:
     for c in num_cols: df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna()
 
+def fetch_ob_chunked(api, symbol, start, end, step=5, timeout=900, chunk_hours=12):
+    """
+    Fetch OB in smaller chunks and concat. Works with your existing /ob-top.
+    """
+    if not start or not end:
+        # fallback to single shot when range isn't specified
+        return fetch_ob(api, symbol, start, end, step=step, timeout=timeout)
+
+    t0 = pd.Timestamp(start).tz_convert("UTC") if pd.Timestamp(start).tzinfo else pd.Timestamp(start, tz="UTC")
+    t1 = pd.Timestamp(end).tz_convert("UTC") if pd.Timestamp(end).tzinfo else pd.Timestamp(end, tz="UTC")
+    frames = []
+    cur = t0
+    delta = pd.Timedelta(hours=chunk_hours)
+
+    while cur < t1:
+        chunk_start = cur.isoformat()
+        chunk_end   = min(cur + delta, t1).isoformat()
+        print(f"[chunk] {chunk_start} -> {chunk_end}")
+        df = fetch_ob(api, symbol, start=chunk_start, end=chunk_end, step=step, timeout=timeout)
+        frames.append(df)
+        cur = cur + delta
+
+    if not frames:
+        raise SystemExit("No data returned for the requested interval.")
+    out = pd.concat(frames).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    return out
+
 def logret(x: pd.Series): 
     return np.log(x).diff()
 
@@ -205,7 +233,14 @@ def main():
     fs: MinMaxScaler = joblib.load(model_dir / "feature_scaler.pkl")
     cols = json.loads((model_dir / "features.json").read_text())
 
-    ob = fetch_ob(args.api, args.symbol, args.start, args.end, step=args.step)
+    # ob = fetch_ob(args.api, args.symbol, args.start, args.end, step=args.step)
+    ob = fetch_ob_chunked(
+        args.api, args.symbol,
+        start=args.start, end=args.end,
+        step=args.step, timeout=args.timeout,
+        chunk_hours=12,   # tune to 6/12/24 as you like
+    )
+
     F = build_features(ob)  # includes mid/open/close at the end
     okx_open = F["open"]; okx_close = F["close"]
     missing = [c for c in cols if c not in F.columns]
