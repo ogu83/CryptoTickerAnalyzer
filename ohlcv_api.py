@@ -99,55 +99,51 @@ def get_orderbook_top(
     if "-" not in symbol:
         symbol = (symbol[:-4] + "-" + symbol[-4:]) if len(symbol) > 6 else (symbol[:-3] + "-" + symbol[-3:])
 
-    start_dt = _parse_dt(start)
-    end_dt   = _parse_dt(end)
+    # Build params
+    params = [symbol]              # inst_id
+    if start is not None: params.append(start)
+    if end   is not None: params.append(end)
+    params.append(step)            # for rn %% %s
 
-    params: List[Any] = [symbol]
-    # IMPORTANT: filter by the base column names (no alias here)
-    where = ["inst_id = %s"]
-    if start_dt is not None:
-        where.append("ts >= %s"); params.append(start_dt)
-    if end_dt is not None:
-        where.append("ts < %s");  params.append(end_dt)
+    where = ["h.inst_id = %s"]
+    if start is not None: where.append("h.ts >= %s")
+    if end   is not None: where.append("h.ts < %s")
 
     sql = f"""
-    SELECT * FROM (
-    SELECT *, row_number() OVER (ORDER BY h.ts) AS rn
-    FROM
-    
     WITH h AS (
     SELECT id, inst_id, ts
-    FROM {schema}.orderbook_header
-    WHERE inst_id = {symbol}            -- and optional ts filters
-        AND ts >= {start_dt}
-        AND ts <  {end_dt}
+    FROM {schema}.orderbook_header h
+    WHERE {" AND ".join(where)}
     ORDER BY ts
-    )
+    ),
+    j AS (
     SELECT
-    h.ts, h.inst_id,
-    bb.bid_px, bb.bid_sz, bb.bid_ct,
-    ba.ask_px, ba.ask_sz, ba.ask_ct
+        h.ts, h.inst_id,
+        bb.bid_px, bb.bid_sz, bb.bid_ct,
+        ba.ask_px, ba.ask_sz, ba.ask_ct
     FROM h
     LEFT JOIN LATERAL (
-    SELECT i.price  AS bid_px,
-            i.qty    AS bid_sz,
-            i.order_count AS bid_ct
-    FROM {schema}.orderbook_item i
-    WHERE i.orderbook_id = h.id AND i.side = 'B'
-    ORDER BY i.price DESC
-    LIMIT 1
+        SELECT i.price AS bid_px, i.qty AS bid_sz, i.order_count AS bid_ct
+        FROM {schema}.orderbook_item i
+        WHERE i.orderbook_id = h.id AND i.side = 'B'
+        ORDER BY i.price DESC
+        LIMIT 1
     ) bb ON TRUE
     LEFT JOIN LATERAL (
-    SELECT i.price  AS ask_px,
-            i.qty    AS ask_sz,
-            i.order_count AS ask_ct
-    FROM {schema}.orderbook_item i
-    WHERE i.orderbook_id = h.id AND i.side = 'A'
-    ORDER BY i.price ASC
-    LIMIT 1
+        SELECT i.price AS ask_px, i.qty AS ask_sz, i.order_count AS ask_ct
+        FROM {schema}.orderbook_item i
+        WHERE i.orderbook_id = h.id AND i.side = 'A'
+        ORDER BY i.price ASC
+        LIMIT 1
     ) ba ON TRUE
-    ) z
-    WHERE (z.rn % {step}) = 1
+    ),
+    z AS (
+    SELECT j.*, row_number() OVER (ORDER BY j.ts) AS rn
+    FROM j
+    )
+    SELECT ts, inst_id, bid_px, bid_sz, bid_ct, ask_px, ask_sz, ask_ct
+    FROM z
+    WHERE (z.rn %% %s) = 1     -- NOTE: double % here
     ORDER BY ts;
     """
 
