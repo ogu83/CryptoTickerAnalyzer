@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_DIR="models_ob/okx_ob_ETH-USDT_step100_mid_delta_norm_lgbm"
-GATE_DIR="models_ob/okx_ob_ETH-USDT_step100_gate_lgbm"
+MODEL_DIR="models_ob/okx_ob_ETH-USDT_step1000_mid_delta_norm_lgbm"
+GATE_DIR="models_ob/okx_ob_ETH-USDT_step1000_gate_lgbm"
 API="http://macbook-server:8200"
 SYMBOL="ETH-USDT"
 STEP=100
