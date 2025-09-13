@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from psycopg.rows import dict_row
 
 from fastapi import FastAPI, HTTPException, Query
@@ -11,6 +11,11 @@ from fastapi.responses import JSONResponse
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
+from psycopg import sql
+
+from fastapi import FastAPI, HTTPException, Query
+import pandas as pd
+from pydantic import BaseModel
 
 # ---------------- Postgres connection info ----------------
 PG_HOST = "macbook-server"
@@ -74,6 +79,17 @@ def _parse_dt(s: str | None) -> datetime | None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
+def _to_float(x):
+    if x is None:
+        return None
+    # handle Decimal/str/numeric gracefully
+    if isinstance(x, Decimal):
+        return float(x)
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
 @app.get("/")
 def root():
     return {
@@ -86,105 +102,104 @@ def root():
         ]
     }
 
-@app.get("/ob-top")
-def get_orderbook_top(
-    symbol: str,
-    start: str | None = Query(None, description="ISO datetime (inclusive)"),
-    end: str   | None = Query(None, description="ISO datetime (exclusive)"),
-    step: int = Query(1, ge=1, description="Return every Nth snapshot (downsample)"),
-) -> JSONResponse:
-    schema = PG_DBO_SCHEMA_OKX  # OB is OKX-only here
+class OBRow(BaseModel):
+    time: datetime
+    symbol: str
+    bid_px: float | None
+    bid_sz: float | None
+    bid_ct: int   | None
+    ask_px: float | None
+    ask_sz: float | None
+    ask_ct: int   | None
+    mid: float | None
+    spread: float | None
+    imbalance: float | None
+    microprice: float | None
 
-    # OKX symbol fix-up
+def _parse_dt(s: Optional[str]) -> Optional[str]:
+    return None if s is None else pd.to_datetime(s, utc=True).isoformat()
+
+@app.get("/ob-top", response_model=List[OBRow])
+def get_orderbook_top(
+    symbol: str = Query(..., description="e.g. ETH-USDT"),
+    start: str = Query(...,  description="ISO datetime, inclusive"),
+    end:   str = Query(...,  description="ISO datetime, exclusive"),
+    step:  int = Query(1,    ge=1),
+    page:  int = Query(1,    ge=1),
+    pagesize: int = Query(5_000_000, ge=1, le=10_000_000),
+    schema: str = Query("okx")
+):
+    # Normalize OKX symbol (your earlier convention)
     if "-" not in symbol:
         symbol = (symbol[:-4] + "-" + symbol[-4:]) if len(symbol) > 6 else (symbol[:-3] + "-" + symbol[-3:])
 
-    # Build params
-    params = [symbol]              # inst_id
-    if start is not None: params.append(start)
-    if end   is not None: params.append(end)
-    params.append(step)            # for rn %% %s
-
-    where = ["h.inst_id = %s"]
-    if start is not None: where.append("h.ts >= %s")
-    if end   is not None: where.append("h.ts < %s")
-
-    sql = f"""
-    WITH h AS (
-    SELECT id, inst_id, ts
-    FROM {schema}.orderbook_header h
-    WHERE {" AND ".join(where)}
-    ORDER BY ts
-    ),
-    j AS (
-    SELECT
-        h.ts, h.inst_id,
-        bb.bid_px, bb.bid_sz, bb.bid_ct,
-        ba.ask_px, ba.ask_sz, ba.ask_ct
-    FROM h
-    LEFT JOIN LATERAL (
-        SELECT i.price AS bid_px, i.qty AS bid_sz, i.order_count AS bid_ct
-        FROM {schema}.orderbook_item i
-        WHERE i.orderbook_id = h.id AND i.side = 'B'
-        ORDER BY i.price DESC
-        LIMIT 1
-    ) bb ON TRUE
-    LEFT JOIN LATERAL (
-        SELECT i.price AS ask_px, i.qty AS ask_sz, i.order_count AS ask_ct
-        FROM {schema}.orderbook_item i
-        WHERE i.orderbook_id = h.id AND i.side = 'A'
-        ORDER BY i.price ASC
-        LIMIT 1
-    ) ba ON TRUE
-    ),
-    z AS (
-    SELECT j.*, row_number() OVER (ORDER BY j.ts) AS rn
-    FROM j
-    )
-    SELECT ts, inst_id, bid_px, bid_sz, bid_ct, ask_px, ask_sz, ask_ct
-    FROM z
-    WHERE (z.rn %% %s) = 1     -- NOTE: double % here
-    ORDER BY ts;
-    """
-
     try:
+        start_dt = _parse_dt(start)
+        end_dt   = _parse_dt(end)
+        if not start_dt or not end_dt:
+            raise ValueError("start/end required")
+
+        sql = f"SELECT * FROM {schema}.get_ob_top_paged(%s,%s,%s,%s,%s,%s);"
+        params = [symbol, start_dt, end_dt, step, page, pagesize]
+
         with pool.connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
+            with conn.cursor() as cur:
+                # optional: guardrails for long scans
+                # cur.execute("SET LOCAL statement_timeout = %s", ("600s",))
                 cur.execute(sql, params)
                 rows = cur.fetchall()
-    except psycopg.Error as e:
-        # psycopg3 may not have .pgerror; use diag/sqlstate when available
-        detail = getattr(e, "pgerror", None) or getattr(getattr(e, "diag", None), "message_primary", None) or str(e)
-        raise HTTPException(status_code=500, detail=f"Database error: {detail}")
 
-    # downsample if requested
-    # if step > 1:
-    #     rows = rows[::step]
+        print(f"Fetched {len(rows)} rows")
 
-    def fnum(x: Any) -> float | None:
-        if x is None: return None
-        if isinstance(x, Decimal): return float(x)
-        try: return float(x)
-        except Exception: return None
+        # Shape & enrich to match your prior API
+        out = []
+        for row in rows:
+            ts       = row["ts"]
+            inst_id  = row["inst_id"]
+            bid_px   = _to_float(row["bid_px"])
+            bid_sz   = _to_float(row["bid_sz"])
+            bid_ct   = row["bid_ct"]
+            ask_px   = _to_float(row["ask_px"])
+            ask_sz   = _to_float(row["ask_sz"])
+            ask_ct   = row["ask_ct"]
 
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        bid_px = fnum(r["bid_px"]); ask_px = fnum(r["ask_px"])
-        bid_sz = fnum(r["bid_sz"]); ask_sz = fnum(r["ask_sz"])
-        mid    = (bid_px + ask_px) / 2.0 if (bid_px is not None and ask_px is not None) else None
-        spread = (ask_px - bid_px) if (bid_px is not None and ask_px is not None) else None
-        imb    = ((bid_sz - ask_sz) / (bid_sz + ask_sz)) if (bid_sz and ask_sz and (bid_sz + ask_sz) != 0) else None
-        micro  = ((bid_px * ask_sz + ask_px * bid_sz) / (bid_sz + ask_sz)) if (bid_px and ask_px and bid_sz and ask_sz and (bid_sz + ask_sz) != 0) else None
+            # print(f"Row: ts={ts} inst_id={inst_id} bid_px={bid_px} ask_px={ask_px}")
 
-        out.append({
-            "time": _to_iso_z(r["ts"]),
-            "inst_id": r["inst_id"],
-            "bid_px": bid_px, "bid_sz": bid_sz, "bid_ct": r["bid_ct"],
-            "ask_px": ask_px, "ask_sz": ask_sz, "ask_ct": r["ask_ct"],
-            "mid": mid, "spread": spread, "imbalance": imb, "microprice": micro,
-        })
+            if isinstance(ts, str):
+                try:
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except Exception:
+                    pass
 
-    return JSONResponse(content=out)
+            mid = spread = imb = micro = None
+            if bid_px is not None and ask_px is not None:
+                mid = (bid_px + ask_px) / 2.0
+                spread = (ask_px - bid_px)
+                if bid_sz and ask_sz and (bid_sz + ask_sz) != 0:
+                    imb = (bid_sz - ask_sz) / (bid_sz + ask_sz)
+                if spread:
+                    micro = (
+                        ask_px * (bid_sz or 0) + bid_px * (ask_sz or 0)
+                    ) / ((bid_sz or 0) + (ask_sz or 0)) if (bid_sz or 0) + (ask_sz or 0) else None
+
+            out.append(dict(
+                time=ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                symbol=inst_id,
+                bid_px=_to_float(bid_px) if bid_px is not None else None,
+                bid_sz=_to_float(bid_sz) if bid_sz is not None else None,
+                bid_ct=bid_ct,
+                ask_px=_to_float(ask_px) if ask_px is not None else None,
+                ask_sz=_to_float(ask_sz) if ask_sz is not None else None,
+                ask_ct=ask_ct,
+                mid=mid, spread=spread, imbalance=imb, microprice=micro
+            ))
+
+        return out;
+
+    except Exception as e:
+        # Bubble up a clean error (no driver internals)
+        msg = getattr(e, "pgerror", None) or str(e)
+        raise HTTPException(status_code=500, detail=f"Database error: {msg}")
 
 @app.get("/tick-chart")
 def get_tick_chart(
