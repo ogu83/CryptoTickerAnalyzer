@@ -207,13 +207,13 @@ def main():
     feat_cols = json.loads(feat_file.read_text())
 
     print(f"[load] {mdir.name}  symbol={args.symbol} step={args.step}")
-    # ob = fetch_ob(args.api, args.symbol, args.start, args.end, step=args.step, timeout=args.timeout)
-    ob = fetch_ob_chunked(
-        args.api, args.symbol,
-        start=args.start, end=args.end,
-        step=args.step, timeout=args.timeout,
-        chunk_hours=12,   # tune to 6/12/24 as you like
-    )
+    ob = fetch_ob(args.api, args.symbol, args.start, args.end, step=args.step, timeout=args.timeout)
+    # ob = fetch_ob_chunked(
+    #     args.api, args.symbol,
+    #     start=args.start, end=args.end,
+    #     step=args.step, timeout=args.timeout,
+    #     chunk_hours=12,   # tune to 6/12/24 as you like
+    # )
     F = build_features(ob)
 
     # keep only rows where all features exist
