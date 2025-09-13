@@ -111,33 +111,44 @@ def get_orderbook_top(
         where.append("ts < %s");  params.append(end_dt)
 
     sql = f"""
-    with h as (
-      select id, inst_id, ts
-      from {schema}.orderbook_header
-      where {" and ".join(where)}
-      order by ts
-    ),
-    bb as (
-      select distinct on (i.orderbook_id)
-             i.orderbook_id, i.price as bid_px, i.qty as bid_sz, i.order_count as bid_ct
-      from {schema}.orderbook_item i
-      join h on h.id = i.orderbook_id
-      where i.side = 'B'
-      order by i.orderbook_id, i.price desc
-    ),
-    ba as (
-      select distinct on (i.orderbook_id)
-             i.orderbook_id, i.price as ask_px, i.qty as ask_sz, i.order_count as ask_ct
-      from {schema}.orderbook_item i
-      join h on h.id = i.orderbook_id
-      where i.side = 'A'
-      order by i.orderbook_id, i.price asc
+    SELECT * FROM (
+    SELECT *, row_number() OVER (ORDER BY h.ts) AS rn
+    FROM
+    
+    WITH h AS (
+    SELECT id, inst_id, ts
+    FROM {schema}.orderbook_header
+    WHERE inst_id = {symbol}            -- and optional ts filters
+        AND ts >= {start_dt}
+        AND ts <  {end_dt}
+    ORDER BY ts
     )
-    select h.ts, h.inst_id, bb.bid_px, bb.bid_sz, bb.bid_ct, ba.ask_px, ba.ask_sz, ba.ask_ct
-    from h
-    left join bb on bb.orderbook_id = h.id
-    left join ba on ba.orderbook_id = h.id
-    order by h.ts
+    SELECT
+    h.ts, h.inst_id,
+    bb.bid_px, bb.bid_sz, bb.bid_ct,
+    ba.ask_px, ba.ask_sz, ba.ask_ct
+    FROM h
+    LEFT JOIN LATERAL (
+    SELECT i.price  AS bid_px,
+            i.qty    AS bid_sz,
+            i.order_count AS bid_ct
+    FROM {schema}.orderbook_item i
+    WHERE i.orderbook_id = h.id AND i.side = 'B'
+    ORDER BY i.price DESC
+    LIMIT 1
+    ) bb ON TRUE
+    LEFT JOIN LATERAL (
+    SELECT i.price  AS ask_px,
+            i.qty    AS ask_sz,
+            i.order_count AS ask_ct
+    FROM {schema}.orderbook_item i
+    WHERE i.orderbook_id = h.id AND i.side = 'A'
+    ORDER BY i.price ASC
+    LIMIT 1
+    ) ba ON TRUE
+    ) z
+    WHERE (z.rn % {step}) = 1
+    ORDER BY ts;
     """
 
     try:
@@ -151,8 +162,8 @@ def get_orderbook_top(
         raise HTTPException(status_code=500, detail=f"Database error: {detail}")
 
     # downsample if requested
-    if step > 1:
-        rows = rows[::step]
+    # if step > 1:
+    #     rows = rows[::step]
 
     def fnum(x: Any) -> float | None:
         if x is None: return None
