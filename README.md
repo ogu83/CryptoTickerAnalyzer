@@ -1,228 +1,129 @@
-# OKX & Binance Tick Collector + OHLCV API + Web UI
+# CryptoTickerAnalyzer
 
-Stream live tickers from **OKX** and **Binance USDⓈ-M Futures** into PostgreSQL, aggregate them into N-tick OHLCV bars via a SQL function, expose them through a **FastAPI** endpoint, and visualize with a lightweight **DevExtreme (jQuery)** UI.
-
-<img width="1819" height="1122" alt="msedge_RuNIj1FRoQ" src="https://github.com/user-attachments/assets/4a69b868-0ceb-4847-9f54-db1c7c08f24a" />
-
----
-
-## Contents
-- [Features](#features)
-- [Requirements](#requirements)
-- [Environment Setup](#environment-setup)
-- [Configuration](#configuration)
-- [Run the Collector](#run-the-collector)
-- [Run the API](#run-the-api)
-- [Run the Web UI](#run-the-web-ui)
-- [API Reference](#api-reference)
-- [Notes & Tips](#notes--tips)
-- [Troubleshooting](#troubleshooting)
+Research framework for streaming **crypto tick & order book data**, training **ML/AI models** on features derived from the book, and running **backtests** with anomaly gates and profitability filters.
 
 ---
 
 ## Features
-- Ingests **OKX** tickers and **Binance** *@ticker* streams via WebSocket.
-- Persists to PostgreSQL:
-  - `okx.ticker`
-  - `bnc.ticker`
-- (Optional) Persists **OKX Order Book** (`okx.orderbook_header` / `okx.orderbook_item`).
-- SQL function “parameterized view” for **N-tick bars** (OHLCV).
-- REST endpoint: `GET /tick-chart?venue=...&symbol=...&period=...`
-- Web UI:
-  - Venue dropdown: **OKX**, **Binance**, or **OKX vs Binance (compare)**
-  - Symbol dropdown (auto-formats symbol per venue, server accepts both styles)
-  - Period dropdown (1 / 10 / 100 / 1000 ticks)
-  - Date range picker (UTC) for server-side filtering
-  - Candlestick charts (1 or 2 stacked in compare mode)
-  - Runtime chart-width control
+
+* **Data ingestion**
+
+  * Stream live tickers from **OKX** and **Binance USDⓈ-M Futures**.
+  * Persist to PostgreSQL (`okx.ticker`, `bnc.ticker`).
+  * Optional: capture **OKX order book** (`okx.orderbook_header` + `okx.orderbook_item`).
+* **Database utilities**
+
+  * SQL function `okx.get_ob_top_paged(symbol, start, end, step, page, pagesize)` for efficient *top-of-book* retrieval.
+  * API endpoint `/ob-top` exposes it as JSON (with computed `mid`, `spread`, `imbalance`, `microprice`).
+* **Models**
+
+  * **Neural (Keras LSTM):** predict normalized mid-price deltas.
+  * **Anomaly Detection:** train on order book reconstruction error, backtest anomaly-gated signals.
+  * **Tree-based (LightGBM):**
+
+    * **Regressor**: predicts mid-price delta norm.
+    * **Classifier Gate**: learns which trades are profitable given regressor outputs + market state.
+* **Backtesting**
+
+  * `ob_anomaly_backtest.py` — anomaly-based gate with rolling quantiles, dynamic min-edge logic.
+  * `ob_lgbm_backtest.py` — LightGBM regressor + optional gate, cost-aware filters.
+  * Sweep scripts (`sweep_gate.sh`, `sweep_gate.ps1`) to explore gate thresholds.
+* **Visualization**
+
+  * Plots like `ob_pred_vs_actual.png`, `*_equity_curve.png` saved automatically for diagnostics.
 
 ---
 
 ## Requirements
-- **Python** 3.9+ (Windows & Linux tested)
-- **PostgreSQL** 12+ (network-accessible from the machine running the collector & API)
-- Network egress to:
-  - `wss://ws.okx.com:8443/ws/v5/public`
-  - `wss://fstream.binance.com/stream`
+
+* **Python** 3.9+ (tested on Windows, Linux)
+* **PostgreSQL** 12+
+* Packages:
+
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+  (Key: `tensorflow`, `lightgbm`, `scikit-learn`, `pandas`, `matplotlib`, `fastapi`, `uvicorn`, `psycopg[binary,pool]`)
 
 ---
 
-## Environment Setup
+## Workflow
 
-### 1) Create a virtual environment
+### 1. Collect Data
 
-**Windows (PowerShell):**
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
-```
-
-**Linux / macOS:**
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip
+python tickers_to_postgres.py
 ```
 
-### 2) Install Python dependencies
-```bash
-pip install "psycopg[binary,pool]" websockets fastapi uvicorn
-```
+Streams OKX/Binance tickers (and order book if enabled) into Postgres.
 
----
+### 2. Run the API
 
-## Configuration
-
-Open `tickers_to_postgres.py` and set your Postgres connection info and instruments:
-
-```python
-# ---------------- Postgres connection info ----------------
-PG_HOST = "macbook-server"
-PG_PORT = 5432
-PG_USER = "postgres"
-PG_PASSWORD = "Postgres2839*"
-PG_DBNAME = "CryptoTickers"  # target DB name
-
-# Schemas are fixed in code:
-# PG_DBO_SCHEMA_OKX = "okx"
-# PG_DBO_SCHEMA_BINANCE = "bnc"
-
-INSTRUMENTS = [
-    "BTC-USDT",
-    "ETH-USDT",
-]
-```
-
-> The script auto-creates the database (if missing), schemas, and tables on startup.
-
-**Optional (Order Book):**  
-In `tickers_to_postgres.py`, set:
-```python
-RECORD_ORDERBOOK = True
-```
-to capture OKX order book (`books` channel) as well.
-
----
-
-## Run the Collector
-
-From your activated venv:
-```bash
-# Windows PowerShell or Linux
-python3 ./tickers_to_postgres.py
-# (On Windows, you can also use: python .	ickers_to_postgres.py)
-```
-
-You should see logs like:
-```
-[db] pool opened (okx-ticker)
-[db] pool opened (bnc-ticker)
-[okx] subscribed to tickers: BTC-USDT, ETH-USDT
-[binance] subscribed to @ticker: BTCUSDT, ETHUSDT
-[stats:okx-ticker] queue=... inserted=...
-[stats:bnc-ticker] queue=... inserted=...
-```
-
----
-
-## Run the API
-
-From your activated venv:
 ```bash
 uvicorn ohlcv_api:app --host 0.0.0.0 --port 8200
 ```
 
-The API connects to the same database and exposes `GET /tick-chart`.
+Endpoints:
 
-> If you changed ports, ensure your web UI points `API_BASE` to the correct one.
+* `GET /tick-chart` — OHLCV bars.
+* `GET /ob-top` — paginated order book top.
 
----
+### 3. Train Models
 
-## Run the Web UI
+* **Neural LSTM**
 
-Serve the `index.html` & `index.js` locally (simple static server):
+  ```bash
+  python train_orderbook.py --algo keras --symbol ETH-USDT --step 5 --target mid_delta_norm --plot
+  ```
+* **LightGBM Regressor**
+
+  ```bash
+  python train_orderbook.py --algo lgbm --symbol ETH-USDT --step 5 --target mid_delta_norm --plot
+  ```
+* **LightGBM Gate**
+
+  ```bash
+  python train_orderbook.py --algo lgbm_gate --symbol ETH-USDT --step 5 --gate-base-bps 7.0 --k-spread 0.3 --cv 5
+  ```
+
+### 4. Backtest
+
+* **Anomaly strategy**
+
+  ```bash
+  python ob_anomaly_backtest.py --model-dir models_ob_anom/okx_ob_anom_ETH-USDT_step5_w64 \
+    --reg-model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_w64 \
+    --symbol ETH-USDT --step 5 --roll-quantile 0.9 --roll-window 2h --plot
+  ```
+* **LightGBM regressor**
+
+  ```bash
+  python ob_lgbm_backtest.py --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm \
+    --symbol ETH-USDT --step 5 --auto-min-edge --k-spread 0.3 --spread-cap-bps 1.5 --plot
+  ```
+* **With gate**
+
+  ```bash
+  python ob_lgbm_backtest.py --model-dir models_ob/okx_ob_ETH-USDT_step5_mid_delta_norm_lgbm \
+    --gate-model-dir models_ob/okx_ob_ETH-USDT_step5_gate_lgbm \
+    --symbol ETH-USDT --step 5 --gate-thr 0.7 --plot
+  ```
+
+### 5. Sweep Gate Thresholds
 
 ```bash
-# from the directory containing index.html
-python3 -m http.server 8201
-```
-
-Open your browser to:  
-`http://localhost:8201/`
-
-**Make sure** the `API_BASE` constant in `index.js` matches your API URL (default: `http://localhost:8200`).
-
----
-
-## API Reference
-
-### `GET /tick-chart`
-
-Returns an array of OHLCV bars aggregated from the underlying tick table via the SQL function `ticker_ohlcv(symbol, period)` (function exists in both `okx` and `bnc` schemas).
-
-**Query Parameters**
-- `venue` — `okx` (default), `bnc`, or `compare` (UI uses `compare` to load both venues separately)
-- `symbol` — instrument identifier
-  - OKX style: `BTC-USDT`, `ETH-USDT`
-  - Binance style: `BTCUSDT`, `ETHUSDT`
-  - **Symbol fixups are automatic** (server-side):
-    - For `venue=bnc`, a `-` is removed (e.g., `BTC-USDT` → `BTCUSDT`)
-    - For `venue=okx`, a `-` is inserted before the last 3 or 4 chars if missing (`BTCUSDT` → `BTC-USDT`)
-- `period` — integer tick group size (e.g., 1 / 10 / 100 / 1000)
-- `start` (optional) — ISO datetime (inclusive), e.g. `2025-08-26T00:00:00Z`
-- `end` (optional) — ISO datetime (exclusive), e.g. `2025-08-27T00:00:00Z`
-
-**Response**
-```json
-[
-  {
-    "time": "2025-08-26T12:34:56Z",
-    "open":  64000.1,
-    "close": 64010.3,
-    "high":  64050.0,
-    "low":   63990.5,
-    "volume": 12.3456
-  }
-]
-```
-
-**Examples**
-```
-/tick-chart?symbol=BTC-USDT&period=100
-/tick-chart?venue=bnc&symbol=BTCUSDT&period=1000
-/tick-chart?symbol=ETH-USDT&period=10&start=2025-08-26T00:00:00Z&end=2025-08-27T00:00:00Z
+bash sweep_gate.sh
+# or on Windows
+.\sweep_gate.ps1
 ```
 
 ---
 
-## Notes & Tips
-- **Schemas used**
-  - OKX: `okx.ticker` (and order book tables if enabled)
-  - Binance: `bnc.ticker`
-- The OHLCV function (`ticker_ohlcv`) exists in **both** schemas; the API selects the right schema by `venue`.
-- The Web UI **Compare** mode calls the API **twice** (OKX + Binance) for the same symbol/period/date range and renders two stacked candlestick charts.
-- **Windows asyncio**: the collector sets `WindowsSelectorEventLoopPolicy` automatically for psycopg async compatibility.
+## Notes
 
----
-
-## Troubleshooting
-
-- **No rows inserted**
-  - Ensure the venv is active and packages are installed in the **same** environment you run the script from.
-  - Check network access to OKX/Binance WebSocket endpoints.
-  - Verify Postgres host/port/user/password are correct and reachable.
-
-- **Event loop warnings on Windows**
-  - Usually harmless on shutdown. Ensure you’re running within the venv and using Python 3.9+.
-
-- **CORS / Browser cannot reach API**
-  - The API enables permissive CORS for `GET`. Ensure the port (default **8200**) is reachable (firewall).
-
-- **UI doesn’t load data**
-  - Confirm `API_BASE` in `index.js` matches your API URL (`http://localhost:8200` by default).
-  - Check the browser console network tab for error responses.
-
----
-
-Happy trading data building! 🚀
+* **Database size**: order book tables can grow very large (50GB+ in weeks).
+  Use paged queries (`page`, `pagesize`) and downsampling (`step`) aggressively.
+* **Costs awareness**: backtests include trading fees (`fee_bps`) and slippage (`slip_bps`).
+* **Gate philosophy**: the regressor provides direction & edge estimate; the classifier gate prunes bad trades.
+* **Diagnostics**: always inspect `equity_curve.png` and logs for hit-rate, pass-rate, and min-edge thresholds.
